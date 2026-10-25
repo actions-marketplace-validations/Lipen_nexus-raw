@@ -13,6 +13,7 @@ pub(crate) async fn get(
     out: Option<&Path>,
     cont: bool,
     segments: Option<usize>,
+    range: Option<&str>,
 ) -> Result<(), Error> {
     if out.is_none() && cli.json {
         return Err(Error::Misuse(
@@ -36,9 +37,14 @@ pub(crate) async fn get(
             "--continue resumes a sibling part file: pass -o FILE, or drop --continue".to_owned(),
         ));
     }
+    if range.is_some() && (cont || segments.is_some()) {
+        return Err(Error::Misuse(
+            "--range reads one span: pass --range without --continue or --segments".to_owned(),
+        ));
+    }
     let ctx = make_ctx(cli, url)?;
     // The renderer drains on every path: the events the run already emitted must reach the output before the failure is reported.
-    let result = run_get(&ctx, url, out, cont, segments).await;
+    let result = run_get(&ctx, url, out, cont, segments, range).await;
     finish(ctx).await;
     result
 }
@@ -49,7 +55,11 @@ async fn run_get(
     out: Option<&Path>,
     cont: bool,
     segments: Option<usize>,
+    range: Option<&str>,
 ) -> Result<(), Error> {
+    if let Some(spec) = range {
+        return run_get_range(ctx, url, out, spec).await;
+    }
     let outcome = match segments {
         Some(n) => {
             ctx.nxr
@@ -213,6 +223,47 @@ async fn run_sha(ctx: &Ctx, target: &str) -> Result<(), Error> {
         d.as_str(),
         &serde_json::json!({"sha256": d.as_str(), "source": target}),
     );
+    Ok(())
+}
+
+async fn run_get_range(ctx: &Ctx, url: &str, out: Option<&Path>, spec: &str) -> Result<(), Error> {
+    let range = ctx.nxr.get_range(url, spec).await?;
+    let label = match range.end {
+        Some(end) => format!("{}-{end}", range.start),
+        None => format!("{}-", range.start),
+    };
+    match out {
+        Some(path) => {
+            nexus_raw_core::primitive::write_bytes_atomically(path, &range.bytes)?;
+            print_line(
+                ctx.json,
+                &format!(
+                    "range {label}: {} bytes → {}",
+                    range.bytes.len(),
+                    path.display()
+                ),
+                &serde_json::json!({
+                    "ok": true,
+                    "url": url,
+                    "out": path.display().to_string(),
+                    "range": label,
+                    "bytes": range.bytes.len(),
+                }),
+            );
+        }
+        None => {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(&range.bytes).map_err(|e| Error::Io {
+                path: "-".to_owned(),
+                detail: e.to_string(),
+            })?;
+            stdout.flush().map_err(|e| Error::Io {
+                path: "-".to_owned(),
+                detail: e.to_string(),
+            })?;
+        }
+    }
     Ok(())
 }
 

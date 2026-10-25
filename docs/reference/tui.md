@@ -25,6 +25,12 @@ Three ways to say which servers open:
 Positional URLs and `--server` presets compose: both open, in that order.
 An unknown preset name is a usage error (exit 2) that names the known presets.
 
+The session also has one TLS policy, like the credentials: `--ca-bundle FILE` (or `NXR_CA_BUNDLE`) adds a private CA, `--tls-insecure` skips verification, and the two exclude each other.
+The bundle carries the CA that signed the server certificate, not the server leaf.
+
+`--no-color` (or a non-empty `NO_COLOR`) drops the red error and green toast colours.
+Bold and reverse remain, so the layout still reads.
+
 Inside the TUI, `s` opens the servers overlay: every server the session knows, with the open ones marked.
 `enter` focuses the tab of the selected server or connects a new one in the background.
 `a` opens the add form.
@@ -89,7 +95,7 @@ Enter resolves the buffer against the working directory and checks it locally: a
 A confirmed folder starts the upload immediately: `put {folder} -> {position}`.
 With the local pane open, `p` prefills the picker with the folder of the pane.
 
-The upload drives the same core pipeline as `nxr up`: a local scan (hidden files, `.sha256` markers and `.part` files stay out, one unsafe name refuses the whole run before the first byte), marker generation for markerless files, the symmetric diff against the remote, then the transfer.
+The upload drives the same core pipeline as `nxr up`: a local scan (hidden files, `.sha256` markers and `.part` files stay out, a symlink or other non-regular entry refuses the whole run, one unsafe name refuses the whole run before the first byte), marker generation for markerless files, the symmetric diff against the remote, then the transfer.
 Markers are always generated: the TUI has no `--no-sha`.
 Same-digest objects are skipped, a divergence refuses the whole run, and an upload never deletes anything on the server.
 

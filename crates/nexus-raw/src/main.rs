@@ -24,12 +24,24 @@ Agent entry points:
 pub(crate) struct Cli {
     /// Credentials as user:pass, curl style.
     /// Env stays preferred for CI: NXR_AUTH (base64 user:pass) or NXR_USERNAME + NXR_PASSWORD.
-    #[arg(short = 'u', long, value_name = "USER:PASS", global = true)]
+    #[arg(
+        short = 'u',
+        long,
+        value_name = "USER:PASS",
+        global = true,
+        help_heading = "Global options"
+    )]
     pub(crate) user: Option<String>,
     /// A remote alias from the config file (the file is read only when this names one).
     /// The alias expands URL arguments that look relative and supplies the credentials.
     /// A `-u` on the same call wins over the alias credentials.
-    #[arg(short = 'R', long, value_name = "ALIAS", global = true)]
+    #[arg(
+        short = 'R',
+        long,
+        value_name = "ALIAS",
+        global = true,
+        help_heading = "Global options"
+    )]
     pub(crate) remote: Option<String>,
     /// The alias credentials resolved by `-R` (never printed).
     /// Kept apart from `user` so the doctor's source line stays honest.
@@ -39,28 +51,65 @@ pub(crate) struct Cli {
     #[arg(skip)]
     pub(crate) alias_name: Option<String>,
     /// Parallel artifact transfers.
-    #[arg(long, global = true, value_name = "N", default_value_t = 8)]
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        value_name = "N",
+        default_value_t = 8
+    )]
     pub(crate) workers: usize,
     /// Attempts per HTTP request.
-    #[arg(long, global = true, value_name = "N", default_value_t = 4)]
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        value_name = "N",
+        default_value_t = 4
+    )]
     pub(crate) retry: u32,
     /// TCP connect timeout in seconds.
-    #[arg(long, global = true, value_name = "SECS", default_value_t = 15)]
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        value_name = "SECS",
+        default_value_t = 15
+    )]
     pub(crate) connect_timeout_secs: u64,
     /// Fail a transfer when no bytes arrive for this many seconds.
-    #[arg(long, global = true, value_name = "SECS", default_value_t = 30)]
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        value_name = "SECS",
+        default_value_t = 30
+    )]
     pub(crate) stall_secs: u64,
     /// Skip TLS certificate verification.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     pub(crate) tls_insecure: bool,
+    /// A PEM bundle of extra trust roots for a private CA (curl's --cacert).
+    /// The bundle carries the CA that signed the server certificate, not the bare server leaf.
+    /// Conflicts with --tls-insecure: a bundle is the safe alternative to disabling verification.
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global options",
+        value_name = "FILE",
+        env = "NXR_CA_BUNDLE",
+        hide_env_values = true,
+        conflicts_with = "tls_insecure"
+    )]
+    pub(crate) ca_bundle: Option<PathBuf>,
     /// Emit one NDJSON event per line on stdout.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help_heading = "Global options")]
     pub(crate) json: bool,
     /// Print only the final summary line.
-    #[arg(short = 'q', long, global = true)]
+    #[arg(short = 'q', long, global = true, help_heading = "Global options")]
     pub(crate) quiet: bool,
     /// Print more detail: transfer starts and plan names.
-    #[arg(short = 'v', long, global = true)]
+    #[arg(short = 'v', long, global = true, help_heading = "Global options")]
     pub(crate) verbose: bool,
     #[command(subcommand)]
     pub(crate) command: Cmd,
@@ -84,6 +133,10 @@ pub(crate) enum Cmd {
         /// File output only: `--segments` with a stdout target is a misuse.
         #[arg(long, value_name = "N")]
         segments: Option<usize>,
+        /// Fetch one byte range: START-END or START- (inclusive), through a Range request.
+        /// Conflicts with --continue and --segments.
+        #[arg(long, value_name = "START-END", conflicts_with_all = ["cont", "segments"])]
+        range: Option<String>,
     },
     /// PUT a file, optionally with its sha-sibling marker.
     Put {
@@ -139,6 +192,10 @@ pub(crate) enum Cmd {
         /// Print the plan without transferring anything.
         #[arg(long, visible_alias = "dry-run")]
         plan: bool,
+        /// Keep only names under this whole-segment prefix (repeatable).
+        /// The selected subtrees are scanned; entries outside them are never read.
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Vec<String>,
     },
     /// Download a remote directory, or one file named by its URL, into a local one (§5.2, §5.2.1).
     Down {
@@ -297,8 +354,8 @@ pub(crate) enum Cmd {
         /// Best-effort enumeration through the server search API.
         #[arg(long)]
         ls: bool,
-        /// Print the plan without transferring anything.
-        #[arg(long)]
+        /// Print the plan without transferring anything (`--plan` is the same flag).
+        #[arg(long, visible_alias = "plan")]
         dry_run: bool,
         /// Credentials for the source only, overriding the shared `-u`.
         #[arg(long, value_name = "USER:PASS")]

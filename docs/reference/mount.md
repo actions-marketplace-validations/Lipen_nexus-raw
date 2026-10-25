@@ -5,6 +5,7 @@ It is a companion binary, not a subcommand of `nxr`: the CLI stays a portable cu
 
 The mount is read-only today.
 It answers listings, attributes and reads.
+The Linux release archives carry `nxr-mount` next to `nxr`. `just mount` runs it from the workspace.
 Every write gets `EROFS`.
 
 ## Run it
@@ -15,7 +16,7 @@ nxr-mount https://nexus.example/repository/raw /mnt/nexus
 
 The URL is the repository directory to mount.
 Credentials come from `-u user:pass`, `NXR_AUTH` (base64) or `NXR_USERNAME` + `NXR_PASSWORD`, in that order, exactly like `nxr`.
-`--tls-insecure` skips certificate verification, and `--workers` caps parallel requests and FUSE dispatch threads.
+`--tls-insecure` skips certificate verification, `--ca-bundle FILE` adds a private CA (also `NXR_CA_BUNDLE`), and `--workers` caps parallel requests and FUSE dispatch threads.
 
 Unmount with `fusermount3 -u /mnt/nexus`.
 
@@ -30,12 +31,14 @@ The mount therefore resolves a node in two steps:
    A non-empty listing makes it a directory, an empty one makes the path `ENOENT`.
 
 `.sha256` markers are hidden from listings, exactly as `nxr ls` hides them.
+Each name segment is percent-encoded when a repository URL is built, so a foreign name with spaces, `?`, `#`, `%` or unicode resolves.
 
 Reads are lazy and block-cached: one block is `--block-kib` KiB (256 by default), fetched with a ranged GET, and the cache is bounded by `--cache-mib` (256 by default).
 A server that ignores `Range` still works: the whole body is sliced to the requested span.
 A read past the end of a file is empty, and `release` drops that file's blocks.
 
 Listings and attributes are cached for two seconds, so a rapid `ls -R` does not re-walk every directory.
+A listing reports a synthetic inode for an entry the kernel has not looked up. The real inode is assigned on lookup, and the node is dropped when the kernel forgets it.
 
 ## Limits
 
@@ -51,12 +54,13 @@ Listings and attributes are cached for two seconds, so a rapid `ls -R` does not 
 | :-- | :-- | :-- |
 | `-u, --user` | env | Credentials as `user:pass`, curl style. |
 | `--tls-insecure` | off | Skip TLS certificate verification. |
+| `--ca-bundle` | none | A PEM bundle of extra trust roots for a private CA (also `NXR_CA_BUNDLE`). The bundle carries the CA that signed the server certificate, not the bare server leaf. Conflicts with `--tls-insecure`. |
 | `--workers` | 8 | Parallel requests and FUSE dispatch threads. |
 | `--retry` | 4 | Attempts per HTTP request. |
 | `--connect-timeout-secs` | 15 | TCP connect timeout. |
 | `--stall-secs` | 30 | Fail a request when no bytes arrive for this long. |
-| `--block-kib` | 256 | One read block in KiB. |
-| `--cache-mib` | 256 | Read-block cache budget in MiB. |
+| `--block-kib` | 256 | One read block in KiB (minimum 4). |
+| `--cache-mib` | 256 | Read-block cache budget in MiB (minimum 1). |
 
 ## Verify
 

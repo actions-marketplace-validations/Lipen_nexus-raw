@@ -40,7 +40,7 @@ flowchart BT
 
 ```toml
 [dependencies]
-nexus-raw-core = "0.23"
+nexus-raw-core = "0.24"
 ```
 
 ## The facade
@@ -65,6 +65,7 @@ let nxr = Nxr::new(
     Config {
         base: "https://nexus.example.com/repository/raw-main/1.4.0/".into(),
         tls_insecure: false,
+        ca_bundle: None,
         workers: 8,
         retry_attempts: 4,
         connect_timeout: Duration::from_secs(15),
@@ -80,6 +81,7 @@ let nxr = Nxr::new(
 Build it from `-u user:pass`, `NXR_AUTH` (base64 `user:pass`) or `NXR_USERNAME` + `NXR_PASSWORD`, exactly as the CLI does.
 `creds::resolve` does this for you.
 `Config::validate` enforces the ranges the CLI flags map onto: workers in `1..=64`, positive timeouts.
+`ca_bundle: Some(PathBuf)` adds a PEM bundle of extra trust roots (the CLI's `--ca-bundle`); it is native only and conflicts with `tls_insecure`.
 
 A complete, self-contained round trip (publish a directory against a scratch server and fetch it back) is `cargo run -p nexus-raw-core --example publish`.
 It starts its own mock server, so the example runs with zero setup, and its shape (build config → open channel → `up` → `down` → drop facade → join the event printer) is the intended embedding pattern.
@@ -91,10 +93,13 @@ Every method mirrors a CLI command one-to-one.
 | Method | Returns | Mirrors | Contract |
 |:--------|:--------|:--------|:---------|
 | `get(url, out, cont)` | `GetOutcome` | `nxr get` | stream a URL to a file or stdout, resume through `<out>.part` |
+| `get_range(url, spec)` | `RangeOutcome` | `nxr get --range` | one `START-END`/`START-` span: HEAD for the open form, a past-the-end start is misuse |
 | `put(url, src, sha)` | `(u64, Option<Digest>)` | `nxr put` | PUT a file, optionally with its sha-sibling |
 | `head(url)` | `HeadInfo` | `nxr head` | status and metadata: 404 is a normal result, not an error |
 | `sha(src)` | `Digest` | `nxr sha` | stream a `ShaSource::File` or `ShaSource::Url` through sha256 |
 | `scan(dir)` | `Vec<ArtifactName>` | the `up` input set | the plain-mode local listing `up` starts from |
+| `scan_prefixes(dir, prefixes)` | `Vec<ArtifactName>` | the `up --prefix` input set | only the selected subtrees are read, keeping each prefix in the name |
+| `sibling_digest(url)` | `Option<Digest>` | the `.sha256` marker read | the marker digest when present, `None` when absent, a malformed marker is `Mismatch` |
 | `diff(dir, names, mode, markers)` | `Vec<Action>` | `up --plan` | the symmetric plan without transferring |
 | `delta(dir, enum_src)` | `Vec<Delta>` | `nxr diff` | the local-against-storage report: `Same`, `MissingLocal`, `MissingRemote`, `Diverged` (size and/or sha), nothing written |
 | `up(dir, names, gen_markers, claim)` | `Summary` | `nxr up` | verified upload: bytes, then the marker of the same name |
@@ -139,6 +144,7 @@ use nexus_raw_core::transport::client::NexusClient;
 let cfg = Config {
     base: "https://nexus.example.com/repository/raw-main/".into(),
     tls_insecure: false,
+    ca_bundle: None,
     workers: 8,
     retry_attempts: 4,
     connect_timeout: Duration::from_secs(15),
@@ -164,6 +170,7 @@ async fn local_digest(nxr: &Nxr, path: &str) -> Result<Digest, nexus_raw_core::E
 ```
 
 `GetOutcome` carries `size`, the `digest` of the written file (stdout mode skips hashing and returns `None`), and `resumed_from`, the part offset the transfer continued from (`0` for a fresh download).
+`RangeOutcome` carries the inclusive `start`, the optional `end`, and the `bytes` of the span.
 
 ## L1: transfer
 

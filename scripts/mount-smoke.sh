@@ -146,6 +146,10 @@ if (printf x > "$mnt/new.txt") 2>/dev/null; then
   fail "a write to the read-only mount succeeded"
 fi
 ui_ok "tree, size, digest and read-only behavior"
+if [ -n "$(find "$mnt" -name '*.sha256' -print -quit)" ]; then
+  fail "a .sha256 marker leaked into the mount"
+fi
+ui_ok "the mount hides .sha256 markers"
 
 "$fusermount" -u "$mnt"
 wait "$mount_pid" || true

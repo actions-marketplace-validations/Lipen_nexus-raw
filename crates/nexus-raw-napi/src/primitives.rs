@@ -4,7 +4,7 @@ use napi::bindgen_prelude::{Either, Uint8Array};
 use napi::Result;
 use napi_derive::napi;
 use nexus_raw_core::model::digest;
-use nexus_raw_core::{GetOutcome, Nxr, ShaSource};
+use nexus_raw_core::{Error, GetOutcome, Nxr, ShaSource};
 use tokio::sync::mpsc;
 
 use crate::error::js_error;
@@ -26,15 +26,60 @@ pub async fn get(url: String, opts: Option<NxrGetOpts>) -> Result<NxrGetResult> 
         o.connect_timeout_ms,
         o.stall_ms,
         o.tls_insecure,
+        o.ca_bundle,
         o.on_event,
     );
     let cfg = mapping::build_config(&url, &common).map_err(js_error)?;
     let (tx, rx) = mpsc::unbounded_channel();
     let nxr = Nxr::new(cfg, tx).map_err(js_error)?;
+    let out = o.out.map(PathBuf::from);
     let pump = spawn_pump(rx, on_event);
-    let outcome = nxr
-        .get(&url, o.out.map(PathBuf::from), o.cont.unwrap_or(false))
-        .await;
+    if let Some(spec) = o.range {
+        if o.cont.unwrap_or(false) {
+            drop(nxr);
+            return Err(finish_pump_err(
+                pump,
+                Error::Misuse("range and cont exclude each other".into()),
+            )
+            .await);
+        }
+        let range = match nxr.get_range(&url, &spec).await {
+            Ok(range) => range,
+            Err(e) => return Err(finish_pump_err(pump, e).await),
+        };
+        if let Some(path) = out {
+            if let Err(e) = nexus_raw_core::primitive::write_bytes_atomically(&path, &range.bytes) {
+                drop(nxr);
+                return Err(finish_pump_err(pump, e).await);
+            }
+        } else {
+            let written = {
+                use std::io::Write as _;
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(&range.bytes).and_then(|()| stdout.flush())
+            };
+            if let Err(e) = written {
+                drop(nxr);
+                return Err(finish_pump_err(
+                    pump,
+                    Error::Io {
+                        path: "-".to_owned(),
+                        detail: e.to_string(),
+                    },
+                )
+                .await);
+            }
+        }
+        let size = range.bytes.len();
+        drop(nxr);
+        finish_pump(pump).await?;
+        return Ok(NxrGetResult {
+            size: size as f64,
+            sha256: None,
+            resumed_from: 0.0,
+        });
+    }
+    let outcome = nxr.get(&url, out, o.cont.unwrap_or(false)).await;
     drop(nxr);
     let outcome: GetOutcome = match outcome {
         Ok(v) => v,
@@ -66,6 +111,7 @@ pub async fn put(
         o.connect_timeout_ms,
         o.stall_ms,
         o.tls_insecure,
+        o.ca_bundle,
         o.on_event,
     );
     let cfg = mapping::build_config(&url, &common).map_err(js_error)?;
@@ -111,6 +157,7 @@ pub async fn head(url: String, opts: Option<NxrCommonOpts>) -> Result<NxrHeadRes
         o.connect_timeout_ms,
         o.stall_ms,
         o.tls_insecure,
+        o.ca_bundle,
         o.on_event,
     );
     let cfg = mapping::build_config(&url, &common).map_err(js_error)?;
@@ -154,6 +201,7 @@ pub async fn sha(target: String, opts: Option<NxrCommonOpts>) -> Result<String> 
         o.connect_timeout_ms,
         o.stall_ms,
         o.tls_insecure,
+        o.ca_bundle,
         o.on_event,
     );
     let cfg = mapping::build_config(&target, &common).map_err(js_error)?;

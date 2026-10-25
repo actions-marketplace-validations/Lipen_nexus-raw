@@ -5,11 +5,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.24.0] - 2026-10-24
+
+### Added
+
+- `--ca-bundle FILE` (also `NXR_CA_BUNDLE`) adds a PEM bundle of trust roots for a private CA.
+  It is native only and conflicts with `--tls-insecure`.
+- `get --range START-END|START-` reads one byte span, to a file or stdout.
+- `up --prefix PREFIX` publishes only the names under a whole-segment prefix, keeping the relative path.
+- `mirror --plan` is the `--dry-run` alias.
+- `nxr-tui --ca-bundle FILE` (also `NXR_CA_BUNDLE`) and `--tls-insecure` apply one TLS policy to the session.
+- `nxr-tui --no-color` and a non-empty `NO_COLOR` drop the two semantic colours.
+- The Node bindings accept `caBundle` for a private CA and `prefixes` on `up`.
+- The Node `get` accepts `range`, with the same span rules as the CLI.
+- The Linux release archives carry `nxr-mount` next to `nxr`, and the Homebrew formula installs it when present.
+- `Nxr::scan_prefixes` and `Nxr::get_range` expose the scoped scan and the one-span read to library consumers.
+- `Nxr::sibling_digest` reads a `.sha256` marker without a transfer. A malformed marker is `Mismatch`.
+
 ### Changed
 
 - The repository's terminal output follows one model: results on stdout, failures, warnings and hints on stderr, and colour is decided per stream.
   Hints carry commands in backticks, `check-docs` and the real-Nexus battery stay quiet on success, and the battery keeps a TTY heartbeat without a hardcoded total.
   The demo reports its mock scenario count and aligns its `--` comments.
+- The local scan refuses a symlink or any other non-regular entry with exit 2 and a hint, instead of silently dropping it from the upload.
+
+### Fixed
+
+- The mount evicts cached blocks per inode and counts the released bytes exactly, so the cache budget no longer drifts.
+- The mount help and reference state the minimum `--block-kib` and `--cache-mib` values.
+- The `.part` suffix joins the reserved names, and a local `.part` staging file is an explicit misuse in `up` instead of a silent omission.
+- `get --range` refuses a start past the end and replaces a symlinked output instead of following it.
+- The `UnsafeName` hint names the regular-file rule, so a symlink refusal no longer points only at the name grammar.
+- The help hides the `NXR_CA_BUNDLE` value instead of echoing the path.
+- `up --prefix` scans only the selected subtrees and validates explicit names path by path, so an unselected symlink no longer refuses the run and the tree is not walked twice.
+- The scan refuses a symlinked source root for plain `up` and `diff`, matching the scoped prefix scan.
+- The mount percent-encodes each path segment, so foreign names with spaces, `?`, `#`, `%` or unicode resolve correctly.
+- The mount forgets a node when the kernel drops its last lookup and reports synthetic inodes for unvisited listing entries, so long browsing sessions stay bounded.
+- The wasm32 build compiles again: the native prefix helpers are gated, and the gate checks the core for the sandbox target.
+- The unreleased `--cache-dir` mount experiment was removed before it shipped. The mount stays memory-only.
 
 ## [0.23.0] - 2026-10-22
 
@@ -512,7 +547,8 @@ The attach job names its repository without a checkout.
 - The `mock-nexus` server with nine failure scenarios as the conformance contract.
 - The documentation site with README in English and Russian.
 
-[Unreleased]: https://github.com/Lipen/nexus-raw/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/Lipen/nexus-raw/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/Lipen/nexus-raw/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/Lipen/nexus-raw/compare/v0.22.1...v0.23.0
 [0.22.1]: https://github.com/Lipen/nexus-raw/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/Lipen/nexus-raw/compare/v0.21.0...v0.22.0

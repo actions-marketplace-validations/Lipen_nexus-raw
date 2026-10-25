@@ -758,13 +758,14 @@ class Reference(unittest.TestCase):
         """A URL whose final segment cannot carry a marker is refused before any byte moves.
 
         The rules the Rust grammar pins: the `.` and `..` segments, an empty segment
-        (a trailing slash), the reserved `.sha256` suffix, a `.nxr`-prefixed segment
-        (local staging and cache), and any character outside `[A-Za-z0-9._-]`,
+        (a trailing slash), the reserved `.sha256` and `.part` suffixes, a `.nxr`-prefixed
+        segment (local staging and cache), and any character outside `[A-Za-z0-9._-]`,
         checked on the percent-decoded segment.
         """
         nx = nxr.Nxr()
         for url in [
             "http://127.0.0.1:1/x.sha256",
+            "http://127.0.0.1:1/x.part",
             "http://127.0.0.1:1/not a name",
             "http://127.0.0.1:1/.",
             "http://127.0.0.1:1/..",
@@ -777,6 +778,19 @@ class Reference(unittest.TestCase):
             with self.assertRaises(nxr.UnsafeName, msg=url):
                 nx.put(url, CONTENT)
         self.assertEqual(nx.requests, [], "the refusal must precede the wire")
+
+    def test_name_grammar_fixture_matches_the_client(self):
+        """The shared fixture is the single name table: every valid segment passes and every invalid one is refused.
+
+        A grammar change lands in the fixture, the Rust test and this one in the same change, so the
+        two implementations cannot drift apart again.
+        """
+        fixture = json.loads((REPO_ROOT / "fixtures" / "name-grammar.json").read_text())
+        for segment in fixture["segments"]["valid"]:
+            nxr._check_name(segment)
+        for segment in fixture["segments"]["invalid"]:
+            with self.assertRaises(nxr.UnsafeName, msg=repr(segment)):
+                nxr._check_name(segment)
 
     def test_malformed_urls_are_misuse(self):
         """A URL with no host, or a scheme outside http(s), is a misuse: exit 2, nothing on the wire.

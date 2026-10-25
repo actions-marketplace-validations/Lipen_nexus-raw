@@ -1,9 +1,20 @@
 //! Command line arguments for `nxr-tui`.
 
+use std::path::PathBuf;
+
 use clap::Parser;
 use nexus_raw_core::Error;
 
 use crate::config::{self, ConfigFile, ServerCfg};
+
+/// The TLS policy of one session: one set for every server, like the credentials.
+#[derive(Debug, Clone, Default)]
+pub struct Tls {
+    /// Skip certificate verification.
+    pub insecure: bool,
+    /// A PEM bundle of extra trust roots for a private CA.
+    pub ca_bundle: Option<PathBuf>,
+}
 
 /// A terminal browser over Nexus raw repositories.
 #[derive(Debug, Clone, Parser)]
@@ -18,17 +29,37 @@ pub struct Args {
     pub bases: Vec<String>,
 
     /// Open the named server preset from the config file (repeatable)
-    #[arg(short, long)]
+    #[arg(short, long, help_heading = "Connection")]
     pub server: Vec<String>,
 
     /// Credentials as user:pass, curl style
     /// (env fallback: NXR_AUTH, or NXR_USERNAME + NXR_PASSWORD)
-    #[arg(short, long)]
+    #[arg(short, long, help_heading = "Connection")]
     pub user: Option<String>,
+
+    /// Skip TLS certificate verification
+    #[arg(long, help_heading = "Connection")]
+    pub tls_insecure: bool,
+
+    /// A PEM bundle of extra trust roots for a private CA (also NXR_CA_BUNDLE)
+    /// The bundle carries the CA that signed the server certificate, not the bare server leaf
+    #[arg(
+        long,
+        value_name = "FILE",
+        env = "NXR_CA_BUNDLE",
+        hide_env_values = true,
+        conflicts_with = "tls_insecure",
+        help_heading = "Connection"
+    )]
+    pub ca_bundle: Option<PathBuf>,
 
     /// Let repositories of every format be opened, not only raw
     #[arg(long)]
     pub all_formats: bool,
+
+    /// Disable the red error and green toast colours (also a non-empty NO_COLOR)
+    #[arg(long)]
+    pub no_color: bool,
 
     /// Headless mode: list the tree, download a subtree, print the summary
     #[arg(long)]
@@ -54,6 +85,15 @@ fn after_help() -> String {
 }
 
 impl Args {
+    /// The TLS policy of this session.
+    #[must_use]
+    pub fn tls(&self) -> Tls {
+        Tls {
+            insecure: self.tls_insecure,
+            ca_bundle: self.ca_bundle.clone(),
+        }
+    }
+
     /// The servers this invocation opens: positional URLs first, then `--server`
     /// presets, then every config preset when neither was given.
     ///
@@ -126,6 +166,41 @@ mod tests {
             name: name.to_owned(),
             url: url.to_owned(),
         }
+    }
+
+    #[test]
+    fn help_groups_the_connection_flags() {
+        use clap::CommandFactory as _;
+        let help = Args::command().render_help().to_string();
+        let connection = help.find("Connection").expect("the connection section");
+        assert!(help[..connection].contains("--smoke"), "{help}");
+        assert!(help[connection..].contains("--tls-insecure"), "{help}");
+        assert!(help[connection..].contains("--ca-bundle"), "{help}");
+        assert!(!help[connection..].contains("--smoke"), "{help}");
+    }
+
+    #[test]
+    fn no_color_flag_parses() {
+        let parsed = Args::parse_from(["nxr-tui", "--no-color", "http://h/"]);
+        assert!(parsed.no_color);
+    }
+
+    #[test]
+    fn tls_flags_parse_and_conflict() {
+        let parsed = Args::parse_from(["nxr-tui", "--tls-insecure", "http://h/"]);
+        assert!(parsed.tls().insecure);
+        assert!(parsed.tls().ca_bundle.is_none());
+        assert!(
+            Args::try_parse_from([
+                "nxr-tui",
+                "--ca-bundle",
+                "ca.pem",
+                "--tls-insecure",
+                "http://h/",
+            ])
+            .is_err(),
+            "the two trust policies exclude each other"
+        );
     }
 
     #[test]

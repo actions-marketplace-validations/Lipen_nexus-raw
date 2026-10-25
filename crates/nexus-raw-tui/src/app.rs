@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
+use crate::net::Session;
+
 /// A bare action key: capitals arrive with Shift, so Shift is allowed.
 /// Control, Alt and Super combos never trigger actions.
 fn pressed(key: &KeyEvent, expected: char) -> bool {
@@ -772,10 +774,12 @@ pub enum Msg {
 pub struct App {
     /// Every server the session knows: opened tabs, presets and added servers.
     pub servers: Vec<ServerCfg>,
-    /// Resolved `Authorization` header value, if any.
-    pub auth: Option<String>,
+    /// The session credentials and TLS policy: one set for every server.
+    pub session: Session,
     /// Repositories of every format may be opened, not only raw.
     pub all_formats: bool,
+    /// Disable the two semantic colours (red errors, green toasts).
+    pub no_color: bool,
     /// The left/right navigation mode of the tree.
     pub nav: Nav,
     /// The download directory from the config: the seed of the session destination.
@@ -860,15 +864,17 @@ impl App {
         config_path: Option<PathBuf>,
         all_formats: bool,
         download_dir: PathBuf,
-        auth: Option<String>,
+        session: Session,
+        no_color: bool,
         tx: mpsc::UnboundedSender<Msg>,
     ) -> Self {
         let nav = config.tui.nav;
         let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             servers,
-            auth,
+            session,
             all_formats,
+            no_color,
             nav,
             destination: download_dir.clone(),
             dest_confirmed: false,
@@ -1738,7 +1744,7 @@ impl App {
         self.status = format!("listing {}/", row.name);
         let url = net::dir_url(&row.url);
         let (tab, gen) = (self.tab, t.gen);
-        net::load_entries(self.tx.clone(), tab, gen, url, self.auth.clone());
+        net::load_entries(self.tx.clone(), tab, gen, url, self.session.clone());
     }
 
     fn descend(&mut self, name: String) {
@@ -1762,7 +1768,7 @@ impl App {
         t.loading = true;
         self.pending += 1;
         let (tab, gen) = (self.tab, t.gen);
-        net::load_entries(self.tx.clone(), tab, gen, url, self.auth.clone());
+        net::load_entries(self.tx.clone(), tab, gen, url, self.session.clone());
     }
 
     fn on_back(&mut self) {
@@ -1805,7 +1811,7 @@ impl App {
                 self.pending += 1;
                 self.status = format!("listing {}/", t.breadcrumb());
                 let (tab, gen) = (self.tab, t.gen);
-                net::load_entries(self.tx.clone(), tab, gen, url, self.auth.clone());
+                net::load_entries(self.tx.clone(), tab, gen, url, self.session.clone());
             }
         }
     }
@@ -1907,7 +1913,14 @@ impl App {
             }
             self.pending += 1;
             self.status = format!("listing {}/", row.rel);
-            net::load_children(self.tx.clone(), tab, gen, row.rel, url, self.auth.clone());
+            net::load_children(
+                self.tx.clone(),
+                tab,
+                gen,
+                row.rel,
+                url,
+                self.session.clone(),
+            );
             return;
         }
         if let Some(t) = self.tabs.get_mut(self.tab) {
@@ -2040,8 +2053,8 @@ impl App {
                     self.status = format!("refreshing {}", t.server.name);
                 }
                 let server = t.server.clone();
-                let (slot, auth) = (idx, self.auth.clone());
-                net::load_repos(self.tx.clone(), server, slot, false, auth);
+                let (slot, session) = (idx, self.session.clone());
+                net::load_repos(self.tx.clone(), server, slot, false, session);
             }
             Screen::Tree => {
                 let url = t.here_url();
@@ -2050,8 +2063,8 @@ impl App {
                 if idx == self.tab && !quiet {
                     self.status = format!("refreshing {}/", t.breadcrumb());
                 }
-                let (tab, gen, auth) = (idx, t.gen, self.auth.clone());
-                net::load_entries(self.tx.clone(), tab, gen, url, auth);
+                let (tab, gen, session) = (idx, t.gen, self.session.clone());
+                net::load_entries(self.tx.clone(), tab, gen, url, session);
             }
         }
     }
@@ -2103,16 +2116,16 @@ impl App {
         };
         self.mode = Mode::Card(Card::File(Box::new(card)));
         self.pending += 2;
-        let (tab, gen, auth) = (self.tab, t.gen, self.auth.clone());
-        net::head_size(self.tx.clone(), tab, gen, rel.clone(), url.clone(), auth);
-        net::fetch_sibling(
+        let (tab, gen, session) = (self.tab, t.gen, self.session.clone());
+        net::head_size(
             self.tx.clone(),
             tab,
             gen,
-            rel,
-            format!("{url}.sha256"),
-            self.auth.clone(),
+            rel.clone(),
+            url.clone(),
+            session.clone(),
         );
+        net::fetch_sibling(self.tx.clone(), tab, gen, rel, url, session);
     }
 
     fn open_servers_overlay(&mut self) {
@@ -2175,7 +2188,7 @@ impl App {
             server,
             self.tabs.len(),
             true,
-            self.auth.clone(),
+            self.session.clone(),
         );
     }
 
@@ -2355,7 +2368,7 @@ impl App {
             ..Transfer::default()
         });
         self.status = format!("put {} -> {}", src.display(), pos);
-        let handle = net::start_upload(self.tx.clone(), base, src, self.auth.clone());
+        let handle = net::start_upload(self.tx.clone(), base, src, self.session.clone());
         if let Some(dl) = self.transfer.as_mut() {
             dl.handle = Some(handle);
         }
@@ -2835,7 +2848,7 @@ impl App {
             ..Transfer::default()
         });
         self.status = format!("downloading {}", row.name);
-        let handle = net::fetch_one(self.tx.clone(), url, out, base, self.auth.clone());
+        let handle = net::fetch_one(self.tx.clone(), url, out, base, self.session.clone());
         if let Some(dl) = self.transfer.as_mut() {
             dl.handle = Some(handle);
         }
@@ -2905,7 +2918,7 @@ impl App {
             repo.dir_url(),
             rel,
             EntryKind::Dir,
-            self.auth.clone(),
+            self.session.clone(),
         );
     }
 
@@ -3176,7 +3189,7 @@ impl App {
                 }
                 self.status = format!("plan: {count} {unit} -> {}", dst.display());
                 let handle =
-                    net::start_download(self.tx.clone(), base, names, dst, self.auth.clone());
+                    net::start_download(self.tx.clone(), base, names, dst, self.session.clone());
                 if let Some(dl) = self.transfer.as_mut() {
                     dl.handle = Some(handle);
                 }
@@ -3385,7 +3398,7 @@ impl App {
                     ..Transfer::default()
                 });
                 self.status = format!("downloading {}", url.rsplit('/').next().unwrap_or(&url));
-                let handle = net::fetch_one(self.tx.clone(), url, out, dst, self.auth.clone());
+                let handle = net::fetch_one(self.tx.clone(), url, out, dst, self.session.clone());
                 if let Some(dl) = self.transfer.as_mut() {
                     dl.handle = Some(handle);
                 }
@@ -3401,8 +3414,13 @@ impl App {
                 }
                 let count = names.len();
                 self.status = format!("plan: {count} files -> {}", dst.display());
-                let handle =
-                    net::start_download(self.tx.clone(), repo_url, names, dst, self.auth.clone());
+                let handle = net::start_download(
+                    self.tx.clone(),
+                    repo_url,
+                    names,
+                    dst,
+                    self.session.clone(),
+                );
                 if let Some(dl) = self.transfer.as_mut() {
                     dl.handle = Some(handle);
                 }
@@ -3664,7 +3682,8 @@ mod tests {
             None,
             all_formats,
             PathBuf::from("dl"),
-            None,
+            Session::default(),
+            false,
             tx,
         );
         app.boot();
@@ -5743,7 +5762,8 @@ mod tests {
             Some(path.clone()),
             false,
             PathBuf::from("dl"),
-            None,
+            Session::default(),
+            false,
             tx,
         );
         app.boot();
@@ -6163,7 +6183,8 @@ mod tests {
             Some(path.clone()),
             false,
             PathBuf::from("dl"),
-            None,
+            Session::default(),
+            false,
             tx,
         );
         app.boot();
@@ -6194,7 +6215,8 @@ mod tests {
             Some(path.clone()),
             false,
             PathBuf::from("dl"),
-            None,
+            Session::default(),
+            false,
             tx,
         );
         app.boot();
@@ -6268,7 +6290,8 @@ mod tests {
             Some(path.clone()),
             false,
             PathBuf::from("dl"),
-            None,
+            Session::default(),
+            false,
             tx,
         );
         app.boot();

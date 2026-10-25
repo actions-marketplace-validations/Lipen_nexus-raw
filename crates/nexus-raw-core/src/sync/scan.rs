@@ -3,18 +3,45 @@
 use std::path::Path;
 
 use crate::error::Error;
-use crate::model::name::ArtifactName;
+use crate::model::name::{ArtifactName, NamePrefix};
+
+/// The directory the walk starts from: a real directory, never a symlink.
+///
+/// A symlinked root would redirect the walk outside the chosen tree, so it is
+/// refused exactly like a symlinked entry.
+fn checked_root(dir: &Path) -> Result<(), Error> {
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::Misuse(format!("not a directory: {}", dir.display()))
+        } else {
+            Error::io(dir, e)
+        }
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(Error::UnsafeName {
+            name: dir.display().to_string(),
+            reason: "symlinked source: dereference it before uploading".to_owned(),
+        });
+    }
+    if !meta.is_dir() {
+        return Err(Error::Misuse(format!("not a directory: {}", dir.display())));
+    }
+    Ok(())
+}
 
 /// Recursively list the artifact names in `dir`.
 ///
 /// Every regular file becomes a candidate name (relative path, `/` separated).
 /// Hidden path segments (starting with `.`) and `*.sha256` siblings are skipped: a sibling is the marker of its bytes, never an artifact of its own.
+/// A symlink or any other non-regular entry is a misuse error (exit 2), never a silent skip.
+/// A symlinked or non-directory root is refused before the walk.
 /// Names that fail the grammar are a misuse error (exit 2), never silently skipped.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] when a directory cannot be listed and [`Error::Misuse`] (or [`Error::UnsafeName`]) when a file path violates the name grammar.
+/// Returns [`Error::Io`] when a directory cannot be listed, [`Error::Misuse`] for a missing or non-directory root, and [`Error::UnsafeName`] for a symlinked root or a file path that violates the name grammar.
 pub fn scan_dir(dir: &Path) -> Result<Vec<ArtifactName>, Error> {
+    checked_root(dir)?;
     let mut names = Vec::new();
     let mut stack = vec![dir.to_owned()];
     while let Some(d) = stack.pop() {
@@ -34,20 +61,8 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<ArtifactName>, Error> {
                 continue;
             }
             let meta = std::fs::symlink_metadata(&path).map_err(|e| Error::io(&path, e))?;
-            if meta.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !meta.is_file() {
-                continue;
-            }
-            if fname.ends_with(".sha256") {
-                continue;
-            }
-            if fname.ends_with(".part") {
-                // The unfinished download of `get -o` next to its target: never an artifact.
-                continue;
-            }
+            // The relative name is computed before the type checks: a refused
+            // entry must carry the name the user can see in the tree.
             let rel = path
                 .strip_prefix(dir)
                 .map_err(|_| Error::misuse(format!("scan root mismatch: {}", path.display())))?
@@ -59,11 +74,99 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<ArtifactName>, Error> {
             // rejects either the phantom or the collision.
             #[cfg(windows)]
             let rel = rel.replace('\\', "/");
+            if meta.file_type().is_symlink() {
+                // A marker is local state, never an artifact: the marker
+                // writer's NOFOLLOW guard refuses it before any transfer.
+                if fname.ends_with(".sha256") {
+                    continue;
+                }
+                return Err(Error::UnsafeName {
+                    name: rel,
+                    reason: "symlinked entry: upload the target, not the link".to_owned(),
+                });
+            }
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !meta.is_file() {
+                return Err(Error::UnsafeName {
+                    name: rel,
+                    reason: "non-regular entry: only files and directories are artifacts"
+                        .to_owned(),
+                });
+            }
+            if fname.ends_with(".sha256") {
+                continue;
+            }
+            // A `.part` file is local download staging, not an artifact. The
+            // name grammar rejects it, so a stale or foreign part fails loudly
+            // here instead of vanishing from the upload.
             names.push(ArtifactName::parse(&rel)?);
         }
     }
     names.sort();
     Ok(names)
+}
+
+/// Recursively list the artifact names under the selected whole-segment
+/// prefixes, keeping the prefix in each name.
+///
+/// Only the selected subtrees are read: an unselected symlink or unsafe name
+/// cannot refuse the walk. The source root and every prefix component must be
+/// a real directory, and a hidden prefix is a misuse.
+///
+/// # Errors
+///
+/// Returns [`Error::Misuse`] for a hidden, missing or non-directory prefix,
+/// [`Error::UnsafeName`] for a symlinked source or prefix, and [`Error::Io`]
+/// from the walk.
+pub fn scan_dir_prefixes(dir: &Path, prefixes: &[NamePrefix]) -> Result<Vec<ArtifactName>, Error> {
+    if prefixes.is_empty() || prefixes.iter().any(|p| p.as_str().is_empty()) {
+        return scan_dir(dir);
+    }
+    checked_root(dir)?;
+    let mut names = std::collections::BTreeSet::new();
+    for prefix in prefixes {
+        let rel = prefix.as_str().trim_end_matches('/');
+        if rel.split('/').any(|seg| seg.starts_with('.')) {
+            return Err(Error::Misuse(format!(
+                "hidden entries are not artifacts: {}",
+                prefix.as_str()
+            )));
+        }
+        let mut cur = dir.to_path_buf();
+        for seg in rel.split('/') {
+            cur.push(seg);
+            let meta = std::fs::symlink_metadata(&cur).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Error::Misuse(format!("prefix is not a directory: {}", cur.display()))
+                } else {
+                    Error::io(&cur, e)
+                }
+            })?;
+            if meta.file_type().is_symlink() {
+                return Err(Error::UnsafeName {
+                    name: rel.to_owned(),
+                    reason: "symlinked prefix: dereference or copy the target".to_owned(),
+                });
+            }
+            if !meta.is_dir() {
+                return Err(Error::Misuse(format!(
+                    "prefix is not a directory: {}",
+                    cur.display()
+                )));
+            }
+        }
+        for name in scan_dir(&cur)? {
+            names.insert(ArtifactName::parse(&format!(
+                "{}{}",
+                prefix.as_str(),
+                name.as_str()
+            ))?);
+        }
+    }
+    Ok(names.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -72,13 +175,48 @@ mod tests {
     use std::fs;
 
     #[test]
+    #[cfg(unix)]
+    fn scan_rejects_a_symlinked_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("real")).unwrap();
+        fs::write(root.join("real/x.bin"), b"x").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let err = scan_dir(&root.join("link")).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsafeName { .. }),
+            "a symlinked root must be refused, not followed: {err:?}"
+        );
+    }
+
+    #[test]
+    fn scan_rejects_a_file_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("file"), b"x").unwrap();
+        let err = scan_dir(&tmp.path().join("file")).unwrap_err();
+        assert!(
+            matches!(err, Error::Misuse(_)),
+            "a file is not a directory: {err:?}"
+        );
+    }
+
+    #[test]
+    fn scan_rejects_a_missing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = scan_dir(&tmp.path().join("absent")).unwrap_err();
+        assert!(
+            matches!(err, Error::Misuse(_)),
+            "a missing root is misuse: {err:?}"
+        );
+    }
+
+    #[test]
     fn scan_skips_hidden_and_siblings() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("a.zip"), b"x").unwrap();
         fs::write(root.join("a.zip.sha256"), b"x").unwrap();
-        fs::write(root.join("a.zip.part"), b"x").unwrap();
         fs::write(root.join("sub").join("b.json"), b"y").unwrap();
         fs::write(root.join(".hidden"), b"z").unwrap();
         let names = scan_dir(root).unwrap();
@@ -99,6 +237,94 @@ mod tests {
         assert!(
             matches!(err, Error::UnsafeName { .. }),
             "expected the grammar to refuse the literal backslash: {err:?}"
+        );
+    }
+
+    #[test]
+    fn prefixes_keep_the_union() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a/x.bin"), b"x").unwrap();
+        fs::write(root.join("b/y.bin"), b"y").unwrap();
+        let prefixes = [
+            NamePrefix::parse("a/").unwrap(),
+            NamePrefix::parse("b/").unwrap(),
+        ];
+        let names: Vec<String> = scan_dir_prefixes(root, &prefixes)
+            .unwrap()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        assert_eq!(names, ["a/x.bin", "b/y.bin"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prefixes_ignore_unselected_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a/x.bin"), b"x").unwrap();
+        std::os::unix::fs::symlink(root.join("a"), root.join("b/link")).unwrap();
+        let prefixes = [NamePrefix::parse("a/").unwrap()];
+        let names: Vec<String> = scan_dir_prefixes(root, &prefixes)
+            .unwrap()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        assert_eq!(names, ["a/x.bin"]);
+    }
+
+    #[test]
+    fn prefixes_refuse_a_missing_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefixes = [NamePrefix::parse("missing/").unwrap()];
+        let err = scan_dir_prefixes(tmp.path(), &prefixes).unwrap_err();
+        assert!(
+            matches!(err, Error::Misuse(_)),
+            "a missing prefix is misuse: {err:?}"
+        );
+    }
+
+    #[test]
+    fn prefixes_refuse_a_hidden_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefixes = [NamePrefix::parse(".hidden/").unwrap()];
+        let err = scan_dir_prefixes(tmp.path(), &prefixes).unwrap_err();
+        assert!(
+            matches!(err, Error::Misuse(_)),
+            "a hidden prefix is misuse: {err:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_rejects_a_symlinked_entry() {
+        // A `latest -> 1.4.0` link inside the tree used to vanish from the
+        // upload with no warning. The scan now carries the name and refuses.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("1.4.0")).unwrap();
+        std::os::unix::fs::symlink(root.join("1.4.0"), root.join("latest")).unwrap();
+        let err = scan_dir(root).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsafeName { .. }),
+            "a symlink must be refused, not silently dropped: {err:?}"
+        );
+    }
+
+    #[test]
+    fn scan_rejects_a_part_staging_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("data.part"), b"x").unwrap();
+        let err = scan_dir(root).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsafeName { .. }),
+            "a part staging file must be refused, not silently dropped: {err:?}"
         );
     }
 

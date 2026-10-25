@@ -7,17 +7,16 @@
 //! Reads are block-cached, listings and attributes live for [`TTL`], and no lock is held across a
 //! network call: the cache mutex only guards map lookups and inserts.
 
-use std::collections::HashMap;
-use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
-
 use fuser::{
     AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyStatfs, Request,
 };
 use nexus_raw_core::{EntryKind, Error, Nxr};
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::runtime::Handle;
 
 /// How long the kernel may cache an attribute or a listing.
@@ -51,6 +50,44 @@ struct State {
     block_bytes: usize,
     listings: HashMap<u64, Listing>,
     attrs: HashMap<u64, Attrs>,
+    lookups: HashMap<u64, u64>,
+}
+
+impl State {
+    /// Drop every cached block of one inode and keep `block_bytes` exact.
+    fn evict_blocks(&mut self, ino: u64) {
+        let mut dropped = 0usize;
+        self.blocks.retain(|(key, _), value| {
+            if *key == ino {
+                dropped += value.len();
+                false
+            } else {
+                true
+            }
+        });
+        self.block_bytes = self.block_bytes.saturating_sub(dropped);
+    }
+
+    /// Drop every cache of one inode and its node after the kernel's last lookup.
+    fn forget(&mut self, ino: u64, nlookup: u64) {
+        if ino == ROOT {
+            return;
+        }
+        let Some(count) = self.lookups.get_mut(&ino) else {
+            return;
+        };
+        *count = count.saturating_sub(nlookup);
+        if *count > 0 {
+            return;
+        }
+        self.lookups.remove(&ino);
+        self.attrs.remove(&ino);
+        self.listings.remove(&ino);
+        self.evict_blocks(ino);
+        if let Some(node) = self.nodes.remove(&ino) {
+            self.paths.remove(&node.path);
+        }
+    }
 }
 
 /// A read-only view of one repository, mounted as a local directory.
@@ -90,7 +127,7 @@ impl NexusFs {
         Self {
             nxr,
             rt,
-            base,
+            base: base.trim_end_matches('/').to_owned(),
             block,
             cache_cap,
             uid,
@@ -103,6 +140,7 @@ impl NexusFs {
                 block_bytes: 0,
                 listings: HashMap::new(),
                 attrs: HashMap::new(),
+                lookups: HashMap::new(),
             }),
         }
     }
@@ -113,15 +151,16 @@ impl NexusFs {
 
     /// The repository URL of one path.
     fn url_for(&self, path: &str) -> String {
-        if path == "/" {
-            format!("{}/", self.base)
-        } else {
-            format!("{}{}", self.base, path)
-        }
+        repo_url(&self.base, path)
     }
 
     fn path_of(&self, ino: u64) -> Option<String> {
         self.state().nodes.get(&ino).map(|node| node.path.clone())
+    }
+
+    /// The inode of a path when the kernel has already looked it up.
+    fn known_ino(&self, path: &str) -> Option<u64> {
+        self.state().paths.get(path).copied()
     }
 
     /// The inode of a path, allocated on first sight.
@@ -240,7 +279,9 @@ impl NexusFs {
                 EntryKind::Dir => FileType::Directory,
                 EntryKind::File => FileType::RegularFile,
             };
-            let child_ino = self.ino_for_path(&child);
+            let child_ino = self
+                .known_ino(&child)
+                .unwrap_or_else(|| synthetic_ino(&child));
             out.push((child_ino, kind, entry.name));
         }
         self.state().listings.insert(
@@ -272,8 +313,7 @@ impl NexusFs {
         let mut state = self.state();
         state.block_bytes += bytes.len();
         if state.block_bytes > self.cache_cap {
-            state.blocks.clear();
-            state.block_bytes = bytes.len();
+            state.evict_blocks(ino);
         }
         state.blocks.insert((ino, index), Arc::clone(&bytes));
         drop(state);
@@ -301,9 +341,20 @@ impl Filesystem for NexusFs {
             _ => join(&parent_path, name),
         };
         match self.attr_for_path(&path) {
-            Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+            Ok(attr) => {
+                self.state()
+                    .lookups
+                    .entry(attr.ino.0)
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+                reply.entry(&TTL, &attr, Generation(0));
+            }
             Err(err) => reply.error(err),
         }
+    }
+
+    fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
+        self.state().forget(ino.0, nlookup);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -392,12 +443,7 @@ impl Filesystem for NexusFs {
     ) {
         {
             let mut state = self.state();
-            let before = state.blocks.len();
-            state.blocks.retain(|(key, _), _| *key != ino.0);
-            let removed = before - state.blocks.len();
-            state.block_bytes = state
-                .block_bytes
-                .saturating_sub(removed.saturating_mul(self.block as usize));
+            state.evict_blocks(ino.0);
         }
         reply.ok();
     }
@@ -453,6 +499,55 @@ fn map_error(error: Error) -> Errno {
     }
 }
 
+/// The repository URL of one FUSE path: the base plus each path segment percent-encoded.
+///
+/// A foreign object name may carry spaces, `?`, `#`, `%` or unicode; the search API
+/// returns it decoded, so every segment is encoded before it becomes a URL.
+fn repo_url(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let rel = path.trim_start_matches('/');
+    if rel.is_empty() {
+        format!("{base}/")
+    } else {
+        format!("{base}/{}", encode_path(rel))
+    }
+}
+
+fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(encode_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn encode_segment(segment: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(segment.len());
+    for &byte in segment.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// A stable synthetic inode for a listing entry the kernel has not looked up.
+///
+/// The high bit keeps it outside the real inode range, so a readdir entry can report
+/// an inode before its lookup without colliding with an allocated one.
+fn synthetic_ino(path: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash | (1 << 63)
+}
+
 /// `parent` plus one segment.
 fn join(parent: &str, name: &str) -> String {
     if parent == "/" {
@@ -472,7 +567,39 @@ fn parent_of(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{join, parent_of};
+    use super::{encode_path, join, parent_of, repo_url, synthetic_ino, Node, State};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_state() -> State {
+        State {
+            nodes: HashMap::new(),
+            paths: HashMap::new(),
+            next_ino: 2,
+            blocks: HashMap::new(),
+            block_bytes: 0,
+            listings: HashMap::new(),
+            attrs: HashMap::new(),
+            lookups: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn repo_url_encodes_foreign_names() {
+        assert_eq!(repo_url("http://h/repo", "/"), "http://h/repo/");
+        assert_eq!(repo_url("http://h/repo/", "/"), "http://h/repo/");
+        assert_eq!(
+            repo_url("http://h/repo/", "/a b/c?d#e%f"),
+            "http://h/repo/a%20b/c%3Fd%23e%25f"
+        );
+    }
+
+    #[test]
+    fn path_encoding_keeps_unreserved_segments() {
+        assert_eq!(encode_path("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(encode_path("a/b"), "a/b");
+        assert_eq!(encode_path("é"), "%C3%A9");
+    }
 
     #[test]
     fn join_keeps_one_slash() {
@@ -485,5 +612,47 @@ mod tests {
         assert_eq!(parent_of("/"), "/");
         assert_eq!(parent_of("/a"), "/");
         assert_eq!(parent_of("/a/b"), "/a");
+    }
+
+    #[test]
+    fn eviction_is_per_ino_and_keeps_the_byte_count() {
+        let mut state = empty_state();
+        state.blocks.insert((1, 0), Arc::new(vec![0; 10]));
+        state.blocks.insert((1, 1), Arc::new(vec![0; 3]));
+        state.blocks.insert((2, 0), Arc::new(vec![0; 7]));
+        state.block_bytes = 20;
+        state.evict_blocks(1);
+        assert_eq!(state.blocks.len(), 1, "the other inode stays cached");
+        assert!(state.blocks.contains_key(&(2, 0)));
+        assert_eq!(
+            state.block_bytes, 7,
+            "the short block is subtracted exactly"
+        );
+    }
+
+    #[test]
+    fn forget_drops_a_node_after_the_last_lookup() {
+        let mut state = empty_state();
+        state.nodes.insert(
+            2,
+            Node {
+                path: "/a".to_owned(),
+            },
+        );
+        state.paths.insert("/a".to_owned(), 2);
+        state.lookups.insert(2, 2);
+        state.forget(2, 1);
+        assert!(state.paths.contains_key("/a"), "one lookup remains");
+        state.forget(2, 1);
+        assert!(!state.paths.contains_key("/a"));
+        assert!(!state.nodes.contains_key(&2));
+    }
+
+    #[test]
+    fn synthetic_inodes_are_stable_and_high() {
+        let a = synthetic_ino("/a/b");
+        assert_eq!(a, synthetic_ino("/a/b"));
+        assert_ne!(a, synthetic_ino("/a/c"));
+        assert!(a > u64::MAX / 2);
     }
 }

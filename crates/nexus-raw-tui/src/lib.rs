@@ -48,7 +48,8 @@
 //!     Some(PathBuf::from("/tmp/nxr-tui.toml")),
 //!     false,
 //!     net::dir_url("http://127.0.0.1:8081").into(),
-//!     None,
+//!     net::Session::default(),
+//!     false,
 //!     tx,
 //! );
 //! app.boot();
@@ -69,5 +70,5 @@ pub use crate::app::{
     cause_of, App, Card, DestPicker, DlEv, DlOutcome, ErrorModal, LocalEntry, LocalPane, Mode, Msg,
     PickSource, RepoRow, Retry, SaveAsDialog, Screen, ShaState, SizeState, Tab, Toast, Transfer,
 };
-pub use crate::args::Args;
+pub use crate::args::{Args, Tls};
 pub use crate::config::{ConfigFile, Nav, ServerCfg};

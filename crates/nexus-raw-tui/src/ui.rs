@@ -29,6 +29,15 @@ fn selected() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }
 
+/// A semantic color, or the plain style when colours are disabled.
+fn semantic(no_color: bool, color: Color) -> Style {
+    if no_color {
+        Style::default()
+    } else {
+        Style::default().fg(color)
+    }
+}
+
 /// Draws one frame: header, body, download panel, status, toasts, overlay.
 /// The mutable borrow carries the list geometry back into the app.
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -325,13 +334,13 @@ fn draw_transfer(f: &mut Frame, app: &App, area: Rect) {
             total.map_or("?".to_owned(), fmt_bytes)
         )));
     }
-    lines.push(outcome_line(dl));
+    lines.push(outcome_line(dl, app.no_color));
     let panel = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(panel, area);
 }
 
 /// The last line of the download panel: retry note, running count or the outcome.
-fn outcome_line(dl: &Transfer) -> Line<'static> {
+fn outcome_line(dl: &Transfer, no_color: bool) -> Line<'static> {
     match &dl.outcome {
         Some(DlOutcome::Done(s)) => Line::from(Span::styled(
             format!(
@@ -351,7 +360,7 @@ fn outcome_line(dl: &Transfer) -> Line<'static> {
             if let Some(hint) = hint {
                 text.push_str(&format!(" ({hint})"));
             }
-            Line::from(Span::styled(text, Style::default().fg(Color::Red)))
+            Line::from(Span::styled(text, semantic(no_color, Color::Red)))
         }
         None if dl.note.is_some() => {
             Line::from(Span::styled(dl.note.clone().unwrap_or_default(), dim()))
@@ -455,7 +464,7 @@ fn draw_toasts(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(
             Line::from(Span::styled(
                 format!(" {} ", toast.text),
-                Style::default().fg(Color::Green),
+                semantic(app.no_color, Color::Green),
             ))
             .right_aligned(),
             row,
@@ -833,4 +842,83 @@ fn error_overlay(modal: &ErrorModal, area: Rect, f: &mut Frame) {
             .wrap(Wrap { trim: false }),
         popup,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::app::{Msg, Tab};
+    use crate::config::{ConfigFile, ServerCfg};
+    use crate::net::Session;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+    use tokio::sync::mpsc;
+
+    fn app_with_help() -> App {
+        let server = ServerCfg::from_base("http://127.0.0.1:1/".to_owned());
+        let tab = Tab::new(server.clone(), Vec::new());
+        let (tx, _rx) = mpsc::unbounded_channel::<Msg>();
+        let mut app = App::new(
+            vec![server],
+            vec![tab],
+            ConfigFile::default(),
+            None,
+            false,
+            PathBuf::from("dl"),
+            Session::default(),
+            false,
+            tx,
+        );
+        app.mode = Mode::Help;
+        app
+    }
+
+    fn text_of(terminal: &Terminal<TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| buffer[(x, y)].symbol().to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn the_help_overlay_renders_its_sections() {
+        let mut app = app_with_help();
+        let backend = TestBackend::new(100, 60);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = text_of(&terminal);
+        assert!(text.contains("nxr-tui keys"), "{text}");
+        assert!(text.contains("this help"), "{text}");
+        assert!(text.contains("navigation"), "{text}");
+    }
+
+    #[test]
+    fn the_help_overlay_survives_a_narrow_terminal() {
+        let mut app = app_with_help();
+        let backend = TestBackend::new(24, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn semantic_colors_are_plain_when_disabled() {
+        assert_eq!(semantic(true, Color::Red), Style::default());
+        assert_eq!(semantic(true, Color::Green), Style::default());
+        assert_eq!(semantic(false, Color::Green).fg, Some(Color::Green));
+        assert_ne!(semantic(false, Color::Red), Style::default());
+    }
+
+    #[test]
+    fn the_failure_line_drops_red_under_no_color() {
+        let dl = Transfer {
+            outcome: Some(DlOutcome::Failed("boom".into(), None)),
+            ..Transfer::default()
+        };
+        let colored = outcome_line(&dl, false);
+        assert_eq!(colored.spans[0].style.fg, Some(Color::Red));
+        let plain = outcome_line(&dl, true);
+        assert_eq!(plain.spans[0].style, Style::default());
+    }
 }

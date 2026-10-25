@@ -21,7 +21,7 @@ use nexus_raw_core::{creds, Config, Nxr};
 
 /// Mount a Nexus raw repository as a local directory.
 #[cfg(target_os = "linux")]
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[command(
     name = "nxr-mount",
     version,
@@ -41,6 +41,16 @@ struct Cli {
     /// Skip TLS certificate verification.
     #[arg(long)]
     tls_insecure: bool,
+    /// A PEM bundle of extra trust roots for a private CA (also NXR_CA_BUNDLE).
+    /// Conflicts with --tls-insecure.
+    #[arg(
+        long,
+        value_name = "FILE",
+        env = "NXR_CA_BUNDLE",
+        hide_env_values = true,
+        conflicts_with = "tls_insecure"
+    )]
+    ca_bundle: Option<std::path::PathBuf>,
     /// Parallel requests and FUSE dispatch threads.
     #[arg(long, default_value_t = 8)]
     workers: usize,
@@ -53,10 +63,10 @@ struct Cli {
     /// Fail a transfer when no bytes arrive for this many seconds.
     #[arg(long, default_value_t = 30)]
     stall_secs: u64,
-    /// Size of one read block, in KiB.
+    /// Size of one read block, in KiB (minimum 4).
     #[arg(long, default_value_t = 256)]
     block_kib: u64,
-    /// Read-block cache budget, in MiB.
+    /// Read-block cache budget, in MiB (minimum 1).
     #[arg(long, default_value_t = 256)]
     cache_mib: u64,
 }
@@ -96,6 +106,7 @@ fn run(cli: Cli) -> Result<(), String> {
     let cfg = Config {
         base: cli.url.clone(),
         tls_insecure: cli.tls_insecure,
+        ca_bundle: cli.ca_bundle,
         workers: cli.workers,
         retry_attempts: cli.retry,
         connect_timeout: Duration::from_secs(cli.connect_timeout_secs),
@@ -137,4 +148,17 @@ fn run(cli: Cli) -> Result<(), String> {
 
     fuser::mount(filesystem, &cli.mountpoint, &options)
         .map_err(|e| format!("mount {}: {e}", cli.mountpoint.display()))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn help_names_no_disk_cache() {
+        let err = Cli::try_parse_from(["nxr-mount", "--help"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(!err.to_string().contains("cache-dir"));
+    }
 }

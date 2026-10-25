@@ -59,6 +59,7 @@ jobs:
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           components: clippy
+          targets: wasm32-unknown-unknown
 
       - name: Set up Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -75,6 +76,9 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check the core for wasm
+        run: cargo check -p nexus-raw-core --target wasm32-unknown-unknown
 
       - name: Run tests
         run: cargo test --workspace
@@ -173,9 +177,18 @@ jobs:
       - name: Build nxr
         run: cargo build --locked --release -p nexus-raw --target ${{ matrix.target }}
 
+      # The mount is Linux-only; the other legs package the CLI alone.
+      - name: Build nxr-mount
+        if: runner.os == 'Linux'
+        run: cargo build --locked --release -p nexus-raw-mount --target ${{ matrix.target }}
+
       - name: Strip the binary
         if: runner.os != 'Windows'
-        run: strip "target/${{ matrix.target }}/release/nxr"
+        run: |
+          strip "target/${{ matrix.target }}/release/nxr"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            strip "target/${{ matrix.target }}/release/nxr-mount"
+          fi
 
       # The binary has to run before it ships: this catches a broken link
       # (missing loader, bad static libc) far cheaper than a user would.
@@ -185,6 +198,9 @@ jobs:
           bin="target/${{ matrix.target }}/release/nxr"
           if [ "${{ runner.os }}" = Windows ]; then bin="$bin.exe"; fi
           "$bin" --version
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            "target/${{ matrix.target }}/release/nxr-mount" --version
+          fi
 
       - name: Pack and checksum
         shell: bash
@@ -193,9 +209,21 @@ jobs:
           if [ "${{ runner.os }}" = Windows ]; then bin="$bin.exe"; fi
           mkdir stage
           cp "$bin" README.md LICENSE stage/
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cp "target/${{ matrix.target }}/release/nxr-mount" stage/
+          fi
           cp -r skills stage/skills
           archive="nxr-${{ matrix.name }}.tar.gz"
           tar -czf "$archive" -C stage .
+          # Read the whole listing first: `grep -q` on a live tar pipe kills tar
+          # with SIGPIPE, and the job shell runs with pipefail.
+          entries=$(tar -tzf "$archive")
+          name="nxr"
+          if [ "${{ runner.os }}" = "Windows" ]; then name="nxr.exe"; fi
+          echo "$entries" | grep -qx "./$name" || { echo "$name missing from $archive" >&2; exit 1; }
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            echo "$entries" | grep -qx "./nxr-mount" || { echo "nxr-mount missing from $archive" >&2; exit 1; }
+          fi
           # macOS ships shasum, not GNU sha256sum; the emitted lines are the
           # same "hash  name" either way, which is what SHA256SUMS needs.
           if command -v sha256sum > /dev/null 2>&1; then
@@ -786,7 +814,7 @@ jobs:
   # `latest` stays on the previous stable version.
   verify:
     name: Verify the published release
-    needs: [publish, pypi, npm, bridge]
+    needs: [build, publish, pypi, npm, bridge]
     if: ${{ !inputs.dry-run }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -804,6 +832,20 @@ jobs:
 
       - name: Build the mock server
         run: cargo build -q -p mock-nexus
+
+      - name: Download the linux-x64 archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: bins-linux-x64
+          path: ${{ runner.temp }}/bins
+
+      # The shipped archive is the artifact users get: both binaries must run.
+      - name: Run the archive binaries
+        run: |
+          mkdir -p "$RUNNER_TEMP/archive"
+          tar -xzf "$RUNNER_TEMP/bins/nxr-linux-x64.tar.gz" -C "$RUNNER_TEMP/archive" ./nxr ./nxr-mount
+          "$RUNNER_TEMP/archive/nxr" --version
+          "$RUNNER_TEMP/archive/nxr-mount" --version
 
       - name: Every artifact is visible on the registries
         run: scripts/registry-audit.sh

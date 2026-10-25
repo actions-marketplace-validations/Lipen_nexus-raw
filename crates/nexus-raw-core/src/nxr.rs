@@ -29,7 +29,7 @@ use crate::model::state::RemoteStatus;
 use crate::primitive;
 use crate::primitive::HeadInfo;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::primitive::{GetOutcome, ShaSource};
+use crate::primitive::{GetOutcome, RangeOutcome, ShaSource};
 use crate::service;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::sync::{
@@ -89,6 +89,61 @@ pub struct Nxr {
     /// The AIMD budget of the most recent directory transfer, kept for
     /// introspection: conformance tests assert the limit was reduced after 429s.
     last_aimd: Arc<std::sync::Mutex<Option<Arc<crate::transport::aimd::WorkerLimit>>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_explicit_names(dir: &Path, names: &[ArtifactName]) -> Result<(), Error> {
+    let mut absent = Vec::new();
+    for name in names {
+        let mut cur = dir.to_path_buf();
+        let segments: Vec<&str> = name.as_str().split('/').collect();
+        let mut missing = false;
+        for (i, seg) in segments.iter().enumerate() {
+            if seg.starts_with('.') {
+                missing = true;
+                break;
+            }
+            cur.push(seg);
+            let meta = match std::fs::symlink_metadata(&cur) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    missing = true;
+                    break;
+                }
+                Err(e) => return Err(Error::io(&cur, e)),
+            };
+            if meta.file_type().is_symlink() {
+                return Err(Error::UnsafeName {
+                    name: name.to_string(),
+                    reason: "symlinked entry: upload the target, not the link".to_owned(),
+                });
+            }
+            if i + 1 == segments.len() {
+                if meta.is_dir() {
+                    missing = true;
+                } else if !meta.is_file() {
+                    return Err(Error::UnsafeName {
+                        name: name.to_string(),
+                        reason: "non-regular entry: only files and directories are artifacts"
+                            .to_owned(),
+                    });
+                }
+            } else if !meta.is_dir() {
+                missing = true;
+            }
+            if missing {
+                break;
+            }
+        }
+        if missing {
+            absent.push(name.to_string());
+        }
+    }
+    if absent.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Missing { names: absent })
+    }
 }
 
 impl Nxr {
@@ -285,6 +340,84 @@ impl Nxr {
         self.client.get_range(url, start, end_incl).await
     }
 
+    /// Read one `START-END` or `START-` byte range.
+    ///
+    /// The open form learns the size with a HEAD; a start at or past the end
+    /// is a misuse, not a successful empty read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Missing`] when the object is absent,
+    /// [`Error::Misuse`] for a malformed or past-the-end range, and the
+    /// transport/auth/HTTP errors of the HEAD or GET.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn get_range(&self, url: &str, spec: &str) -> Result<RangeOutcome, Error> {
+        let (start, end) = primitive::parse_range(spec)?;
+        let len = match end {
+            Some(end) => end
+                .checked_sub(start)
+                .and_then(|d| d.checked_add(1))
+                .ok_or_else(|| Error::Misuse("the byte range overflows u64".to_owned()))?,
+            None => {
+                let info = self.head(url).await?;
+                if info.status == 404 {
+                    return Err(Error::Missing {
+                        names: vec![url.to_owned()],
+                    });
+                }
+                let size = info.size.ok_or_else(|| {
+                    Error::Misuse(
+                        "the server did not report a size: use START-END instead".to_owned(),
+                    )
+                })?;
+                if start >= size {
+                    return Err(Error::Misuse(format!(
+                        "range starts at {start}, past the end of {size} bytes"
+                    )));
+                }
+                size - start
+            }
+        };
+        let bytes = self
+            .read_range(url, start, len)
+            .await?
+            .ok_or_else(|| Error::Missing {
+                names: vec![url.to_owned()],
+            })?;
+        // A 416 reaches the core as an empty span: a start at or past the end
+        // is not a successful empty read.
+        if bytes.is_empty() && len > 0 {
+            let info = self.head(url).await?;
+            if info.status == 404 {
+                return Err(Error::Missing {
+                    names: vec![url.to_owned()],
+                });
+            }
+            if let Some(size) = info.size {
+                if start >= size {
+                    return Err(Error::Misuse(format!(
+                        "range starts at {start}, past the end of {size} bytes"
+                    )));
+                }
+            }
+        }
+        Ok(RangeOutcome { start, end, bytes })
+    }
+
+    /// The `.sha256` marker digest of one object, when the server has a marker.
+    ///
+    /// A missing marker is `None`; a marker outside the `sha256sum -c` format is
+    /// [`Error::Mismatch`], because a digest that cannot be read cannot verify
+    /// anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, auth or HTTP errors from the marker read, and
+    /// [`Error::Mismatch`] when the marker does not parse.
+    pub async fn sibling_digest(&self, url: &str) -> Result<Option<Digest>, Error> {
+        crate::primitive::sibling_digest(&self.client, url).await
+    }
+
     /// The sha256 of a file or URL (spec §5.1).
     ///
     /// # Errors
@@ -305,6 +438,57 @@ impl Nxr {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn scan(&self, dir: &Path) -> Result<Vec<ArtifactName>, Error> {
         sync::scan_dir(dir)
+    }
+
+    /// The artifact names under the selected whole-segment prefixes.
+    ///
+    /// Only the selected subtrees are read: an unselected symlink or unsafe
+    /// name cannot refuse the run. A prefix must name a real directory whose
+    /// components are not symlinks; a hidden prefix is a misuse.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Misuse`] for a bad or missing prefix, [`Error::UnsafeName`]
+    /// for a symlink, and [`Error::Io`] from the walk.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn scan_prefixes(
+        &self,
+        dir: &Path,
+        prefixes: &[String],
+    ) -> Result<Vec<ArtifactName>, Error> {
+        let parsed = prefixes
+            .iter()
+            .map(|p| crate::model::name::NamePrefix::parse(p))
+            .collect::<Result<Vec<_>, _>>()?;
+        sync::scan_dir_prefixes(dir, &parsed)
+    }
+
+    /// Resolve the names an `up` works on: an explicit list is validated path
+    /// by path, `None` scans the whole directory. The explicit path never
+    /// walks unrelated entries, so a caller that already scoped the tree pays
+    /// for its names only.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn resolve_up_names(
+        &self,
+        dir: &Path,
+        names: Option<Vec<ArtifactName>>,
+    ) -> Result<Vec<ArtifactName>, Error> {
+        match names {
+            Some(list) => {
+                validate_explicit_names(dir, &list)?;
+                Ok(list)
+            }
+            None => {
+                let scanned = self.scan(dir)?;
+                if scanned.is_empty() {
+                    return Err(Error::misuse(format!(
+                        "nothing to upload: {} holds no artifacts",
+                        dir.display()
+                    )));
+                }
+                Ok(scanned)
+            }
+        }
     }
 
     /// The symmetric plan without transferring anything (`up --plan`).
@@ -588,7 +772,7 @@ impl Nxr {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] and [`Error::UnsafeName`] from the scan, [`Error::Misuse`] when `dir` is not a directory, the scan is empty, or the claim is unknown, and [`Error::Missing`] when a requested name is absent from the scan.
+    /// Returns [`Error::Io`] and [`Error::UnsafeName`] from the scan or the explicit-name check, [`Error::Misuse`] when `dir` is not a directory, the scan is empty, or the claim is unknown, and [`Error::Missing`] when a requested name is absent from the tree.
     /// Returns [`Error::Mismatch`] when a local object is broken or as the first [`Verdict`](crate::error::Verdict) refusal of the diff, and the first transport/auth/HTTP failure or [`Error::Io`] from marker generation.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn up(
@@ -601,28 +785,7 @@ impl Nxr {
         if !dir.is_dir() {
             return Err(Error::misuse(format!("not a directory: {}", dir.display())));
         }
-        let names = if let Some(list) = names {
-            let scanned = self.scan(dir)?;
-            let have: std::collections::HashSet<&ArtifactName> = scanned.iter().collect();
-            let absent: Vec<String> = list
-                .iter()
-                .filter(|n| !have.contains(n))
-                .map(std::string::ToString::to_string)
-                .collect();
-            if !absent.is_empty() {
-                return Err(Error::Missing { names: absent });
-            }
-            list
-        } else {
-            let scanned = self.scan(dir)?;
-            if scanned.is_empty() {
-                return Err(Error::misuse(format!(
-                    "nothing to upload: {} holds no artifacts",
-                    dir.display()
-                )));
-            }
-            scanned
-        };
+        let names = self.resolve_up_names(dir, names)?;
         let mut locals = sync::local_statuses(dir, names).await;
         if gen_markers {
             up::generate_markers(dir, &mut locals).await?;
@@ -686,28 +849,7 @@ impl Nxr {
         if !dir.is_dir() {
             return Err(Error::misuse(format!("not a directory: {}", dir.display())));
         }
-        let names = if let Some(list) = names {
-            let scanned = self.scan(dir)?;
-            let have: std::collections::HashSet<&ArtifactName> = scanned.iter().collect();
-            let absent: Vec<String> = list
-                .iter()
-                .filter(|n| !have.contains(n))
-                .map(std::string::ToString::to_string)
-                .collect();
-            if !absent.is_empty() {
-                return Err(Error::Missing { names: absent });
-            }
-            list
-        } else {
-            let scanned = self.scan(dir)?;
-            if scanned.is_empty() {
-                return Err(Error::misuse(format!(
-                    "nothing to upload: {} holds no artifacts",
-                    dir.display()
-                )));
-            }
-            scanned
-        };
+        let names = self.resolve_up_names(dir, names)?;
         let mut locals = sync::local_statuses(dir, names).await;
         if gen_markers {
             up::generate_markers(dir, &mut locals).await?;

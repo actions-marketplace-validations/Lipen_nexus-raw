@@ -32,6 +32,7 @@ fn config(mock: &MockNexus, auth: Option<String>) -> Config {
 fn config_at(base: String, auth: Option<String>) -> Config {
     Config {
         base,
+        ca_bundle: None,
         workers: 4,
         retry_attempts: 4,
         connect_timeout: Duration::from_secs(5),
@@ -498,6 +499,66 @@ async fn up_manifest_missing_local_name_is_data_error() {
         .unwrap_err();
     assert!(matches!(err, Error::Missing { .. }), "got {err:?}");
     assert_eq!(err.exit_code(), 1);
+}
+
+#[tokio::test]
+async fn explicit_up_hidden_name_is_data_error() {
+    let mock = MockNexus::start(Scenario::Atomic).unwrap();
+    let local = TempDir::new().unwrap();
+    std::fs::write(local.path().join(".hidden"), CONTENT).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let nxr = Nxr::new(config(&mock, None), tx).unwrap();
+
+    let err = nxr
+        .up(local.path(), Some(names(&[".hidden"])), true, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Missing { .. }), "got {err:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_up_refuses_a_symlinked_parent() {
+    let mock = MockNexus::start(Scenario::Atomic).unwrap();
+    let local = TempDir::new().unwrap();
+    std::fs::create_dir(local.path().join("real")).unwrap();
+    std::fs::write(local.path().join("real/x.zip"), CONTENT).unwrap();
+    std::os::unix::fs::symlink(local.path().join("real"), local.path().join("link")).unwrap();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let nxr = Nxr::new(config(&mock, None), tx).unwrap();
+
+    let err = nxr
+        .up(local.path(), Some(names(&["link/x.zip"])), true, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::UnsafeName { .. }), "got {err:?}");
+    assert_eq!(err.exit_code(), 2);
+}
+
+#[tokio::test]
+async fn sibling_digest_reads_the_marker_and_refuses_a_bad_one() {
+    let mock = MockNexus::start(Scenario::Atomic).unwrap();
+    mock.insert(&format!("{VERSION}/a.zip"), CONTENT);
+    let digest = Digest::of_bytes(CONTENT);
+    mock.insert(
+        &format!("{VERSION}/a.zip.sha256"),
+        sibling::format_line("a.zip", &digest).as_bytes(),
+    );
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let nxr = Nxr::new(config(&mock, None), tx).unwrap();
+    let url = format!("{}1.0.0/a.zip", mock.base_url());
+    assert_eq!(nxr.sibling_digest(&url).await.unwrap(), Some(digest));
+
+    let absent = format!("{}1.0.0/absent.zip", mock.base_url());
+    assert_eq!(nxr.sibling_digest(&absent).await.unwrap(), None);
+
+    mock.insert(&format!("{VERSION}/bad.zip"), CONTENT);
+    mock.insert(&format!("{VERSION}/bad.zip.sha256"), b"not a marker");
+    let bad = format!("{}1.0.0/bad.zip", mock.base_url());
+    assert!(matches!(
+        nxr.sibling_digest(&bad).await.unwrap_err(),
+        Error::Mismatch { .. }
+    ));
 }
 
 #[tokio::test]
