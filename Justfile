@@ -8,7 +8,7 @@ default:
 
 # Tool switches, one place to change them.
 cargo := "cargo"
-prek := "uvx prek@0.5.5"
+prek := "uvx prek@0.5.7"
 
 # Usage example: `just cargo test -p nexus-raw-core`.
 [doc('Run any cargo subcommand with flags.')]
@@ -51,6 +51,12 @@ mount-smoke:
 [group('brew')]
 brew-formula *args:
     @scripts/brew-formula.sh {{ args }}
+
+# Fail when the committed formula lags or drifted from the latest release.
+[doc('Check the Homebrew formula against the latest release.')]
+[group('brew')]
+brew-check:
+    @scripts/check-brew-formula.sh
 
 # `--auth user:pass` and scenario flags come after the scenario name.
 # Usage: `just mock atomic --port 8080`.
@@ -99,12 +105,11 @@ test-python:
     {{ cargo }} build -q -p mock-nexus
     python3 -m unittest discover clients/python
 
-# The full gate a change must pass before it lands: fmt, clippy, prek, tests.
-[doc('The whole gate: fmt + clippy + prek + tests + version agreement.')]
+# The full gate a change must pass before it lands: wasm, the prek hooks
+# (fmt and clippy included), tests and the version agreement.
+[doc('The whole gate: wasm + prek + tests + version agreement.')]
 [group('check')]
 check:
-    just fmt -- --check
-    just clippy
     just wasm-check
     just lint
     just version-check
@@ -449,7 +454,7 @@ demo-cast *args:
 [doc('Serve the docs site with live reload (http://localhost:8000).')]
 [group('docs')]
 docs *args:
-    uvx zensical@0.0.71 serve {{ args }}
+    uvx zensical@0.0.73 serve {{ args }}
 
 # A docs link or config typo fails the build instead of shipping broken pages.
 [doc('Build the docs, check hints, llms.txt and fail on issues.')]

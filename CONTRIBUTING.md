@@ -6,7 +6,7 @@ The repository is a Rust workspace (`crates/`), a docs site (`docs/`) and five e
 ## Build and test
 
 ```bash
-just check        # fmt + clippy + wasm-check + prek + version-check + tests: the gate
+just check        # wasm-check + prek (fmt, clippy, the hooks) + version-check + deny + tests: the gate
 just test         # unit and conformance suites alone
 just check-docs   # the docs site builds and every link resolves
 just demo         # a real session against the mock server and stub payloads
@@ -53,7 +53,7 @@ Transcripts in the docs come from a real run: paste what the binary printed, nev
 ## Versioning
 
 One version for the whole workspace, `[workspace.package] version` in `Cargo.toml`.
-`nexus-raw-core`, `nexus-raw` and `mock-nexus` inherit it; `nexus-raw-napi` inherits it too, because the npm package carries the same number; `nexus-raw-tui` inherits it as well.
+`nexus-raw-core`, `nexus-raw` and `mock-nexus` inherit it. `nexus-raw-napi` inherits it too, because the npm package carries the same number. `nexus-raw-tui` inherits it as well.
 
 Before 1.0 a minor release may break anything. A patch release may not.
 The public surface is larger than the Rust API: CLI flags and their defaults, exit codes 0/1/2/3, the `--json` shapes, the `hint:` text the docs quote, and the wire invariants (the `<name>.sha256` marker, the enumeration document, claim-first, the refusal to overwrite a diverged object).
@@ -100,6 +100,10 @@ git commit -S -m "chore: bump the brew formula to X.Y.Z"
 ```
 
 `scripts/brew-formula.sh --check` verifies the committed formula against its own release.
+
+`scripts/check-brew-formula.sh` compares the committed formula with the latest published release and fails when it lags or drifted.
+`just brew-check` runs it.
+The daily smoke workflow and CI on master run it too, so a forgotten bump is red within a day.
 
 The workflow gates on the core suite, builds every platform, publishes the crates in dependency order, the node addons and the npm packages, and then verifies the published release.
 The release gate also runs the same docs check as the Docs workflow and `just check-docs`, so a broken link or a stale CLI page stops the release before anything publishes.

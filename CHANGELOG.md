@@ -7,6 +7,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 Nothing yet.
 
+## [0.24.1] - 2026-10-29
+
+### Security
+
+- The compression stack moves to `zstd` 0.14.3, past [RUSTSEC-2026-0391](https://rustsec.org/advisories/RUSTSEC-2026-0391).
+  The vulnerable `with_context` constructors ranged over `>=0.13.2, <0.14.3`, and `zstd` arrives through `reqwest` for HTTP body decoding.
+
+### Fixed
+
+- The `-q/--quiet` help text, the output reference and the generated shell completions agree that failures survive quiet mode.
+
 ## [0.24.0] - 2026-10-24
 
 ### Added
@@ -281,7 +292,7 @@ Nothing yet.
   The wire contract is unchanged: segmented reads are a client-side strategy over `Range: bytes=start-end`.
 - Windows joins as a first-class platform: the `mirror` staging lock works there (the lock file is opened with sharing disabled, so a concurrent run for the same pair refuses exactly as on unix), and CI builds and tests the workspace on `windows-latest` next to the ubuntu leg.
 - `nxr diff --via search --ls`: the remote side of the delta report is built from the search API's per-asset facts (name, digest, size) in one paged listing, instead of a HEAD/sibling probe pair per name.
-  `--prefix` filters the facts client-side; the report shape and exit codes are the plain `diff` ones.
+  `--prefix` filters the facts client-side. The report shape and exit codes are the plain `diff` ones.
   A searched asset without a search-reported digest counts as changed, never equal.
   A search refusal (400/404) refuses with the `cannot enumerate` hint naming the search API, or with `--fallback` degrades explicitly: a warning line, then the probe-based report over `--ls` or explicit names.
 - Adaptive transfer workers (AIMD): a directory transfer starts with `--workers` and halves its in-flight capacity whenever a request fails with a `Retry-After` (a 429), reclaiming permits still held as their transfers finish.
@@ -547,7 +558,8 @@ The attach job names its repository without a checkout.
 - The `mock-nexus` server with nine failure scenarios as the conformance contract.
 - The documentation site with README in English and Russian.
 
-[Unreleased]: https://github.com/Lipen/nexus-raw/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/Lipen/nexus-raw/compare/v0.24.1...HEAD
+[0.24.1]: https://github.com/Lipen/nexus-raw/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/Lipen/nexus-raw/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/Lipen/nexus-raw/compare/v0.22.1...v0.23.0
 [0.22.1]: https://github.com/Lipen/nexus-raw/compare/v0.22.0...v0.22.1

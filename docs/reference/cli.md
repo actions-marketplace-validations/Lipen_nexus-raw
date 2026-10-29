@@ -71,7 +71,7 @@ All flags are global: they may appear before or after the subcommand.
 | `--tls-insecure` | off | skip certificate verification |
 | `--ca-bundle <FILE>` | none | a PEM bundle of extra trust roots for a private CA (also `NXR_CA_BUNDLE`). The bundle carries the CA that signed the server certificate, not the bare server leaf. Native only, and mutually exclusive with `--tls-insecure` |
 | `--json` | off | machine output, see [output](#output) |
-| `-q, --quiet` | off | only the final summary line |
+| `-q, --quiet` | off | the summary line, plus any failures |
 | `-v, --verbose` | off | plan names and transfer starts |
 
 ## nxr get
@@ -89,7 +89,7 @@ With `-o` the bytes stream into `<FILE>.part`, which is renamed to `FILE` only a
 | `-o, --out <FILE>` | output file. stdout when omitted |
 | `--continue` | resume from an existing `<FILE>.part` through a `Range: bytes=N-` request |
 | `--segments <N>` | fetch through `N` concurrent byte-range requests (2 to 64). File output only: a stdout target is a misuse (exit 2). `--continue` and `--segments` exclude each other |
-| `--range <RANGE>` | one byte span, `START-END` or `START-`; `START-` reads to the end. Goes to `-o` or stdout; conflicts with `--continue` and `--segments` |
+| `--range <RANGE>` | one byte span, `START-END` or `START-`, where `START-` reads to the end. The span goes to `-o` or stdout. Conflicts with `--continue` and `--segments` |
 
 ```console
 $ nxr get https://nexus.example.com/repository/raw-main/1.4.0/app-1.4.0.zip
@@ -375,7 +375,7 @@ Every artifact is streamed into a part file, hashed on the fly, checked against 
 | Flag | Meaning |
 |:-----|:--------|
 | `--name <NAME>` | one explicit name, repeat as needed |
-| `--names-from <FILE>` | read names from a file, one per line (`-` is stdin); repeatable, combines with `--name` |
+| `--names-from <FILE>` | read names from a file, one per line (`-` is stdin). Repeatable, combines with `--name` |
 | `--ls` | best-effort enumeration through the server search API |
 | `--fresh` | ignore existing part files, every name downloads from zero |
 | `--segments <N>` | split each artifact into `N` concurrent Range spans, 2..=64. The worker budget still caps the total concurrency |
@@ -422,8 +422,8 @@ The downloaded directory verifies offline, because every fetched name gets a loc
 $ cat vendor/app/app-1.4.0.zip.sha256
 a8a242091894256798c34ed08c990bccb4a275883335d9209f9954b12e36ac1f  app-1.4.0.zip
 $ nxr verify vendor/app/
-verify: 2 ok, FAILED: none
 uploaded 0, downloaded 0, skipped 2
+verify: 2 ok, FAILED: none
 $ echo $?
 0
 ```
@@ -486,7 +486,7 @@ $ echo $?
 0
 ```
 
-The `--json` plan lines carry `{"plan":"download|skip|seal","name":…}`; the summary gains `"sealed"`, the count of markers written without a transfer.
+The `--json` plan lines carry `{"plan":"download|skip|seal","name":…}`. The summary gains `"sealed"`, the count of markers written without a transfer.
 
 | Exit | When |
 |:----:|:-----|
@@ -549,7 +549,7 @@ A fully converged directory reports every name as `same` and exits 0.
 `--via search --ls` builds the remote side of the report from the search API's per-asset facts (name, digest, size), the same listing `nxr service assets` reads.
 One paged listing replaces the HEAD-and-sibling pair per name, so a big tree is compared in O(pages) requests.
 The report shape, the sections and the exit codes are the plain `diff` ones.
-`--prefix` filters the search facts client-side; `--name`/`--names-from` are refused (they would fight the listing as the name source) unless `--fallback` names them as the degraded source.
+`--prefix` filters the search facts client-side. `--name` and `--names-from` are refused (they would fight the listing as the name source) unless `--fallback` names them as the degraded source.
 
 The honesty rules, enforced in code:
 A searched asset that lacks a search-reported digest counts as changed (`diverged` with `sha: false`), never as `same`: there is nothing to verify against.
@@ -683,7 +683,7 @@ $ echo $?
 | `2` | misuse: an unsafe `--name` |
 | `3` | transport or auth failure: the `failed:` list names where the run stopped |
 
-`--json` prints one event per name and the summary last.
+`--json` prints one event per name, then a `summary` event. A refusal before the deletion stage prints a single `error` object.
 A rerun emits `missing` events and still exits 0:
 
 ```json
@@ -816,7 +816,7 @@ $ echo $?
 ```
 
 `--assets` lists the artifact names under a version directory (`/repository/<name>/<group…>/<version>/`), the enumeration `down --ls` consumes.
-The tree form (`ls <URL>`) works at any depth, the repository root included; `--assets` makes the same version-directory assumption the transfer commands make.
+The tree form (`ls <URL>`) works at any depth, the repository root included. `--assets` makes the same version-directory assumption the transfer commands make.
 It scopes the search with `q=<directory>/` exactly like the entry listing, and cuts the names client-side.
 Neither listing sends the `group` parameter: on one measured Nexus release it matched Maven coordinates rather than raw path prefixes, and nested listings lied.
 Treat both as conveniences only.
@@ -916,13 +916,10 @@ No network.
 Every checked name must be complete: bytes present, sibling present, digest matching.
 Markerless, broken or missing names are reported and the exit is 1.
 
-| Flag | Meaning |
-|:-----|:--------|
-
 ```console
 $ nxr verify dist/1.4.0/
-verify: 3 ok, FAILED: none
 uploaded 0, downloaded 0, skipped 3
+verify: 3 ok, FAILED: none
 $ echo $?
 0
 $ printf 'tampered' >> dist/1.4.0/pinned.xml
@@ -950,8 +947,8 @@ Check a repository for integrity and print what it finds: one line per finding, 
 The default structural mode reads metadata only: the raw tree (the authoritative listing, markers included), one small GET per marker, and the search facts as an independent cross-check when the index is alive.
 Asset bytes are never read.
 It classifies `orphan` (bytes without marker), `dangling_marker` (marker without bytes), `unparseable_marker` (a marker outside the `sha256sum -c` format) and `diverged_fact` (marker digest and search fact disagree).
-A refusal of the search listing (400/404) refuses the audit with the enumeration hint: an audit over an incomplete listing is not an audit. A fresh upload missing from the lagging index is not a finding: the tree and the markers are the truth, not the index.
-A fresh upload missing from the not-yet-caught-up index is not a finding: the tree and the markers are the truth, not the index.
+A refusal of the search listing (400/404) refuses the audit with the enumeration hint, because an audit over an incomplete listing is not an audit.
+A fresh upload missing from a not-yet-caught-up index is not a finding: the tree and the markers are the truth, not the index.
 
 `--bytes` adds a download and sha256 check of every asset against its marker: the only mode that catches silent bitrot, at the price of reading every object.
 `--sample N` byte-checks a deterministic stride sample of N objects instead, so a sampled run selects the same objects and is reproducible.
@@ -1242,11 +1239,11 @@ The line vocabulary:
 - `↑ name ok`, `↓ name ok`, `○ name skipped` when a name settles.
 - `× name removed`, `○ name missing` when `rm` settles a name (`× name` in `-v` before the DELETEs go out).
 - `↻ name: retry N (reason)` when an attempt is replayed.
-- `uploaded N, downloaded N, skipped N`, the final summary of every transfer.
-- `removed N, skipped K`, the final summary of `rm`, replacing the upload/download line when something was deleted.
+- `uploaded N, downloaded N, skipped N`, the summary of every transfer.
+- `removed N, skipped K`, the summary of `rm`, replacing the upload/download line when something was deleted.
 - `failed: name, name` after the summary, when names did not land.
 
-`-q` trims to the final summary line.
+`-q` keeps the summary line and the failure lines, and drops the per-name progress and the plan.
 `-v` adds plan names and transfer starts, each with the size in human units (`↓ app.zip 24 B`, `↑ log.txt 1.2 KiB`).
 
 Colors are terminal-only.
