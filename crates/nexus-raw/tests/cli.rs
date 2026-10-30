@@ -1309,11 +1309,11 @@ fn down_names_from_empty_refuses() {
         "--names-from",
         list_path.to_str().unwrap(),
     ]);
-    expect_exit(&down, 1, "empty names file refuses");
+    expect_exit(&down, 2, "an empty names file is misuse");
     let err = stderr(&down);
     assert!(
-        err.contains("no --name/--names-from/--ls given"),
-        "the refusal names all three sources: {err}"
+        err.contains("carried no names"),
+        "the refusal names the file, not a missing source: {err}"
     );
 }
 
@@ -1351,6 +1351,149 @@ fn get_continue_without_output_is_misuse() {
     let out = nxr(&["get", "--continue", &url]);
     expect_exit(&out, 2, "resume without a target is misuse");
     assert!(stderr(&out).contains("--continue"), "{}", stderr(&out));
+}
+
+/// `-o -` is not stdout: naming it creates a file called `-`, a trap, so it is misuse.
+#[test]
+fn get_naming_stdout_as_a_file_is_misuse() {
+    let srv = server(Scenario::Atomic);
+    srv.insert("a.bin", ALPHA);
+    let url = format!("{}a.bin", root_url(&srv));
+    let out = nxr(&["get", &url, "-o", "-"]);
+    expect_exit(&out, 2, "a file named - is misuse");
+    assert!(
+        stderr(&out).contains("stdout is the default"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// A `get` stream into a closed stdout ends like SIGPIPE, not as a disk error.
+#[cfg(unix)]
+#[test]
+fn get_to_a_closed_stdout_ends_with_141() {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let srv = server(Scenario::Atomic);
+    srv.insert("a.bin", ALPHA);
+    let url = format!("{}a.bin", root_url(&srv));
+    let mut child = Command::new(NXR)
+        .args(["get", &url])
+        .env_remove("NXR_AUTH")
+        .env_remove("NXR_USERNAME")
+        .env_remove("NXR_PASSWORD")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("nxr starts");
+    drop(child.stdout.take());
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    let status = child.wait().unwrap();
+
+    assert_eq!(
+        status.code(),
+        Some(141),
+        "a closed sink ends like SIGPIPE: {err}"
+    );
+    assert!(
+        err.is_empty(),
+        "no disk-error blame on a closed pipe: {err}"
+    );
+}
+
+/// A console that cannot take the bytes (a full disk) is a failure, not a shrug.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_full_stdout_is_reported_not_swallowed() {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let srv = server(Scenario::Atomic);
+    srv.insert("latest", b"1.0.0\n");
+    let url = format!("{}latest", root_url(&srv));
+    let full = std::fs::File::create("/dev/full").expect("the kernel provides /dev/full");
+    let mut child = Command::new(NXR)
+        .args(["channel", "get", &url])
+        .env_remove("NXR_AUTH")
+        .env_remove("NXR_USERNAME")
+        .env_remove("NXR_PASSWORD")
+        .stdout(Stdio::from(full))
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("nxr starts");
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    let status = child.wait().unwrap();
+
+    assert_eq!(status.code(), Some(1), "a full stdout fails the run: {err}");
+    assert!(
+        err.contains("cannot write to stdout"),
+        "the write failure is named: {err}"
+    );
+}
+
+/// A names file stamped with a UTF-8 BOM (a Windows editor) reads as written.
+#[test]
+fn a_names_file_with_a_bom_reads_as_written() {
+    let srv = server(Scenario::Atomic);
+    srv.insert("a.bin", ALPHA);
+    let dir = TempDir::new().unwrap();
+    let list = dir.path().join("names.txt");
+    std::fs::write(&list, "\u{feff}a.bin\n").unwrap();
+    let dst = dir.path().join("out");
+    let down = nxr(&[
+        "down",
+        &root_url(&srv),
+        dst.to_str().unwrap(),
+        "--names-from",
+        list.to_str().unwrap(),
+    ]);
+    expect_exit(&down, 0, "the BOM is not part of the name");
+    assert!(dst.join("a.bin").is_file(), "the name landed");
+}
+
+/// A destination that is a file is a naming mistake, named as such, not a bare
+/// "File exists" from `create_dir_all`.
+#[test]
+fn a_file_destination_is_misuse() {
+    let srv = server(Scenario::Atomic);
+    srv.insert("a.bin", ALPHA);
+    let dir = TempDir::new().unwrap();
+    let dst = dir.path().join("taken");
+    std::fs::write(&dst, b"not a directory").unwrap();
+    let dst = dst.to_str().unwrap();
+
+    let down = nxr(&["down", &root_url(&srv), dst, "--name", "a.bin"]);
+    expect_exit(
+        &down,
+        2,
+        &format!("a file destination is misuse: {}", stderr(&down)),
+    );
+    assert!(
+        stderr(&down).contains("exists and is not a directory"),
+        "{}",
+        stderr(&down)
+    );
+
+    let clone = nxr(&["clone", &root_url(&srv), dst]);
+    expect_exit(&clone, 2, "a file destination is misuse for clone too");
+    assert!(
+        stderr(&clone).contains("exists and is not a directory"),
+        "{}",
+        stderr(&clone)
+    );
 }
 
 /// `-q` keeps the summary line and drops the per-event output.

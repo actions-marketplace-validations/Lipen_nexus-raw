@@ -49,7 +49,11 @@ pub fn config_path() -> Result<PathBuf, Error> {
 }
 
 /// One alias: the endpoint and how to answer "who are you".
+///
+/// Unknown keys are refused: a typo in `user` would otherwise turn into an
+/// anonymous request and a confusing 401.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Alias {
     /// The base URL the alias expands to.
     pub url: String,
@@ -136,11 +140,13 @@ fn run_pass_cmd(alias: &str, cmd: &str) -> Result<String, Error> {
         .map_err(|e| misuse(format!("alias `{alias}`: pass_cmd failed to run: {e}")))?;
     if !out.status.success() {
         let body = String::from_utf8_lossy(&out.stderr);
-        let first = body.lines().next().unwrap_or("").to_owned();
-        return Err(misuse(format!(
-            "alias `{alias}`: pass_cmd exited {}: {first}",
-            out.status.code().unwrap_or(-1)
-        )));
+        let first = body.lines().next().unwrap_or("").trim();
+        let code = out.status.code().unwrap_or(-1);
+        return Err(misuse(if first.is_empty() {
+            format!("alias `{alias}`: pass_cmd exited {code}")
+        } else {
+            format!("alias `{alias}`: pass_cmd exited {code}: {first}")
+        }));
     }
     let pass = String::from_utf8_lossy(&out.stdout);
     let pass = pass.trim_end_matches(['\r', '\n']);
@@ -152,6 +158,7 @@ fn run_pass_cmd(alias: &str, cmd: &str) -> Result<String, Error> {
 
 /// The parsed file: a map of alias names.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Aliases {
     /// The `[alias.<name>]` tables.
     #[serde(rename = "alias")]
@@ -174,15 +181,40 @@ impl Aliases {
             ))
         })?;
         // The parser's Display embeds the offending source line, and this file
-        // is exactly where an inline password lives: keep the path and the fact,
-        // never the excerpt.
+        // is exactly where an inline password lives: keep the path and the key,
+        // never an excerpt.
         let parsed: Aliases = toml::from_str(&text).map_err(|_| {
+            let reason = Self::unknown_key(&text)
+                .unwrap_or_else(|| "check the TOML keys and value types".to_owned());
             misuse(format!(
-                "{} is not a valid alias file (check the TOML keys and value types)",
+                "{} is not a valid alias file: {reason}",
                 path.display()
             ))
         })?;
         Ok(parsed)
+    }
+
+    /// The first unknown key, named without its value: a key is diagnostic data,
+    /// a value may be an inline password.
+    fn unknown_key(text: &str) -> Option<String> {
+        const KEYS: [&str; 6] = ["url", "user", "pass", "user_env", "pass_env", "pass_cmd"];
+        let value: toml::Value = toml::from_str(text).ok()?;
+        let table = value.as_table()?;
+        for top in table.keys() {
+            if top != "alias" {
+                return Some(format!(
+                    "unknown top-level key `{top}`, aliases live under `[alias.<name>]`"
+                ));
+            }
+        }
+        for (name, entry) in table.get("alias")?.as_table()? {
+            for key in entry.as_table()?.keys() {
+                if !KEYS.contains(&key.as_str()) {
+                    return Some(format!("alias `{name}` has unknown key `{key}`"));
+                }
+            }
+        }
+        None
     }
 
     /// The named alias, with every name listed in the error when absent.
@@ -364,6 +396,31 @@ url = "https://anon.example.com"
         );
         assert!(e.contains("cannot read"), "{e}");
         assert!(e.contains("only read when -R"), "{e}");
+    }
+
+    #[test]
+    fn a_silent_pass_cmd_failure_has_no_trailing_colon() {
+        let (_d, p) = write("[alias.corp]\nurl = \"x\"\nuser = \"u\"\npass_cmd = \"exit 3\"\n");
+        let a = Aliases::load(&p).unwrap();
+        let e = format!("{}", a.get("corp").unwrap().creds("corp").unwrap_err());
+        assert!(e.ends_with("pass_cmd exited 3"), "{e}");
+    }
+
+    #[test]
+    fn a_remote_table_is_named_as_the_wrong_guess() {
+        let (_d, p) = write("[remote.corp]\nurl = \"x\"\n");
+        let e = format!("{}", Aliases::load(&p).unwrap_err());
+        assert!(
+            e.contains("unknown top-level key `remote`") && e.contains("[alias.<name>]"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_names_the_alias_and_the_key() {
+        let (_d, p) = write("[alias.corp]\nurl = \"x\"\nusernmae = \"u\"\n");
+        let e = format!("{}", Aliases::load(&p).unwrap_err());
+        assert!(e.contains("alias `corp` has unknown key `usernmae`"), "{e}");
     }
 
     #[test]

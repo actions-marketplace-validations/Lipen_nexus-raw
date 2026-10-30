@@ -37,7 +37,7 @@ hint: check the command line arguments
 
 ## Exit codes are the API
 
-Exit `0` continues, `1` is a data problem (a retry fails identically), `2` is a broken job definition, `3` is transport trouble (the same command is expected to succeed on a later run).
+Exit `0` continues, `1` is a data problem (a retry fails identically), `2` is a broken job definition, `3` is transport trouble (the same command is expected to succeed on a later run), and `141` means the job truncated the stream itself (`nxr --json up ... | head -1`), which the [reference](../reference/errors.md) explains.
 The cause-and-fix table: [exit codes](troubleshoot.md#exit-codes-cause-and-fix).
 The full taxonomy: [errors and exit codes](../reference/errors.md).
 
@@ -154,7 +154,7 @@ $ nxr -u deployer:pw doctor https://nexus.example.com/repository/raw-main/1.4.0/
 doctor:
   [  ok  ] credentials: resolved from -u flag
   [  ok  ] tls: verification is ON
-  [  ok  ] settings: workers 8, retry 4, stall 30s, connect 15s
+  [  ok  ] settings: workers 8, retry 4 (probes run once), stall 30s, connect 15s
   [  ok  ] probe: HEAD https://nexus.example.com/repository/raw-main/1.4.0/manifest.json → HTTP 200
   all checks passed
 ```

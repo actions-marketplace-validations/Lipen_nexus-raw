@@ -43,7 +43,7 @@ $ env NXR_AUTH=Y2ktYm90OnRva2Vu nxr doctor https://nexus.example.com/repository/
 doctor:
   [  ok  ] credentials: resolved from NXR_AUTH
   [  ok  ] tls: verification is ON
-  [  ok  ] settings: workers 8, retry 4, stall 30s, connect 15s
+  [  ok  ] settings: workers 8, retry 4 (probes run once), stall 30s, connect 15s
   [  ok  ] probe: HEAD https://nexus.example.com/repository/raw-main/1.4.0/ → HTTP 404
   all checks passed
 $ echo $?
@@ -86,7 +86,7 @@ With `-o` the bytes stream into `<FILE>.part`, which is renamed to `FILE` only a
 
 | Flag | Meaning |
 |:-----|:--------|
-| `-o, --out <FILE>` | output file. stdout when omitted |
+| `-o, --out <FILE>` | output file. stdout when omitted. `-o -` is misuse, because a file called `-` is a trap |
 | `--continue` | resume from an existing `<FILE>.part` through a `Range: bytes=N-` request. The assembled bytes are hashed against the local or server-side `.sha256` sibling before the rename, and a divergence is refused (exit 1) with the part removed |
 | `--segments <N>` | fetch through `N` concurrent byte-range requests (2 to 64). File output only: a stdout target is a misuse (exit 2). `--continue` and `--segments` exclude each other |
 | `--range <RANGE>` | one byte span, `START-END` or `START-`, where `START-` reads to the end. The span goes to `-o` or stdout. Conflicts with `--continue` and `--segments` |
@@ -392,6 +392,9 @@ Resuming is the default: a rerun picks up the part files of a killed run through
 A URL that ends at a file is itself a source: `nxr down …/1.4.0/app.zip vendor/` syncs the `…/1.4.0/` directory for the name `app.zip` and writes `vendor/app.zip` with the same marker, resume and digest checks as a directory run.
 The parent directory is the sync root and the last segment is the name.
 With `--name`, `--names-from` or `--ls` the URL keeps its old meaning, the directory to enumerate, so a directory URL should end with a slash.
+A `--names-from` file with CRLF endings or a UTF-8 BOM on the first line works as written on Windows.
+A file that carries no names is misuse, not an empty plan.
+A line that ends in the reserved `.sha256` or `.part` suffix is refused: a list names artifacts, and the marker is the tool's own product (see [the names rule](protocol.md#names)).
 Without any source, and when the URL names a directory, `down` refuses with `cannot enumerate` (exit 1) and a hint naming the explicit sources (see [the refusal transcript](errors.md#enumeration-refusal-exit-1)).
 
 ```console
@@ -1150,6 +1153,7 @@ Settings are validated, not just echoed: workers outside `1..=64`, `--retry 0` o
 With a URL: one `HEAD` probe for reachability.
 Any status below 500 passes, except 401 and 403: the server rejected the credentials, the probe fails, and the detail is the probe line itself (`HEAD <URL> → HTTP 401: any non-5xx means the server is reachable`).
 A 5xx or a connection failure fails the probe as transport.
+Every probe honors `--connect-timeout-secs` and `--stall-secs`, and a doctor run retries nothing: against a host that accepts and never answers, the defaults spend one stall window per probe, so `--stall-secs 2` turns a minute-scale diagnosis into seconds.
 
 Missing credentials are a warning, not a failure: the run reports `none found` and still exits 0, because anonymous requests are a legitimate setup against a read-open repository.
 
@@ -1174,7 +1178,7 @@ $ env NXR_AUTH=Y2ktYm90OnRva2Vu nxr doctor https://nexus.example.com/repository/
 doctor:
   [  ok  ] credentials: resolved from NXR_AUTH
   [  ok  ] tls: verification is ON
-  [  ok  ] settings: workers 8, retry 4, stall 30s, connect 15s
+  [  ok  ] settings: workers 8, retry 4 (probes run once), stall 30s, connect 15s
   [ FAIL ] probe: transport: https://nexus.example.com/repository/raw-main/: error sending request for url (https://nexus.example.com/repository/raw-main/)
 error: transport: https://nexus.example.com/repository/raw-main/: 1 check(s) failed
 hint: check the network: transfers are resumable, rerunning is safe
@@ -1189,7 +1193,7 @@ $ env NXR_AUTH=Y2ktYm90OnRva2Vu nxr doctor https://nexus.example.com/repository/
 doctor:
   [  ok  ] credentials: resolved from NXR_AUTH
   [  ok  ] tls: verification is ON
-  [  ok  ] settings: workers 8, retry 4, stall 30s, connect 15s
+  [  ok  ] settings: workers 8, retry 4 (probes run once), stall 30s, connect 15s
   [  ok  ] proxy: no proxy in the environment
   [  ok  ] probe: status endpoint answered: the server is reachable
   [  ok  ] deep:version: status endpoint answered
