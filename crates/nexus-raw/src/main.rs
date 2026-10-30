@@ -7,6 +7,7 @@ mod alias;
 mod cmd;
 mod render;
 
+use crate::render::outln;
 use clap::{Parser, Subcommand};
 
 use std::path::PathBuf;
@@ -551,7 +552,7 @@ fn run_main() -> std::process::ExitCode {
                 .to_owned();
             let hint = "check the command shape: nxr --help, or nxr <command> --help";
             if json {
-                println!(
+                outln!(
                     "{}",
                     serde_json::json!({
                         "event": "error",
@@ -571,7 +572,7 @@ fn run_main() -> std::process::ExitCode {
         if cli.json {
             // The NDJSON channel carries the failure alone: scripts parse this
             // line, and a plaintext echo on stderr would leak into their logs.
-            println!(
+            outln!(
                 "{}",
                 serde_json::json!({
                     "event": "error",
@@ -598,7 +599,7 @@ fn run_main() -> std::process::ExitCode {
             if cli.json {
                 // The NDJSON channel carries the failure alone: scripts parse
                 // this line, they do not scrape stderr.
-                println!(
+                outln!(
                     "{}",
                     serde_json::json!({
                         "event": "error",

@@ -2067,16 +2067,14 @@ fn unsafe_name_is_misuse_exit_2() {
 /// a dead base (connection refused) is a transport error: exit 3.
 #[test]
 fn dead_base_exit_3() {
-    // A bound-then-dropped listener: the port is closed for certain.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
+    // Port 1, not a bound-then-dropped ephemeral port: another test's mock can
+    // take the freed port and answer 404 before the request arrives, so the
+    // freed-port trick is a race. The kernel never hands out 1 as ephemeral.
     let out = TempDir::new().unwrap();
     let target = out.path().join("x.bin");
     let get = nxr(&[
         "get",
-        &format!("http://127.0.0.1:{port}/x.bin"),
+        "http://127.0.0.1:1/x.bin",
         "-o",
         target.to_str().unwrap(),
         "--retry",
@@ -6255,4 +6253,55 @@ fn up_wait_index_timeout_is_a_warning_not_a_failure() {
     assert_eq!(wait["visible"], 0);
     assert_eq!(wait["total"], 1);
     assert_eq!(wait["timeout"], true, "the budget expired");
+}
+
+// ---- pipelines ------------------------------------------------------------
+
+/// A consumer that closes the pipe (`nxr --json up ... | head -1`) must not
+/// panic on a worker thread: the output stops, the transfer finishes, and the
+/// exit code stays the operation's own.
+#[cfg(unix)]
+#[test]
+fn a_consumer_that_closes_the_pipe_ends_the_run_silently() {
+    use std::io::{BufRead, BufReader, Read as _};
+    use std::process::Stdio;
+
+    let srv = server(Scenario::Atomic);
+    let dir = TempDir::new().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for i in 0..200 {
+        std::fs::write(src.join(format!("f{i}.bin")), ALPHA).unwrap();
+    }
+    let mut child = Command::new(NXR)
+        .args(["--json", "up"])
+        .arg(&src)
+        .arg(dir_url(&srv))
+        .args(["--workers", "1"])
+        .env_remove("NXR_AUTH")
+        .env_remove("NXR_USERNAME")
+        .env_remove("NXR_PASSWORD")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("nxr starts");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    reader.read_line(&mut first).unwrap();
+    drop(reader);
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    let status = child.wait().unwrap();
+
+    assert!(!first.is_empty(), "the first event arrives");
+    assert!(status.success(), "the run keeps its own exit code: {err}");
+    assert!(
+        !err.contains("panicked"),
+        "no panic text on the closed pipe: {err}"
+    );
 }
