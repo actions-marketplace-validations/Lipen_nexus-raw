@@ -308,8 +308,10 @@ pub const SCENARIO_DOCS: &[ScenarioDoc] = &[
         id: "search-lag",
         name: "The search index lags behind writes.",
         behavior: &[
-            "The first storage PUT arms a catch-up deadline (6000 ms).",
+            "The first storage PUT arms a catch-up deadline (6000 ms, the binary's `--lag-ms`).",
             "`GET /service/rest/v1/search/assets` answers the empty page until the deadline passes, then a store-backed listing.",
+            "Each asset carries the size of its stored bytes and, when a marker sits beside the bytes, the marker's digest.",
+            "A marker row reports no digest.",
         ],
         invariant: "up --wait-index holds the run until the uploaded names surface in the search answer and reports the wait.
 The expired budget is a warning line, never a failed exit.",
@@ -328,6 +330,16 @@ The expired budget is a warning line, never a failed exit.",
             "Every other request behaves like `atomic`.",
         ],
         invariant: "A server that ignores `Range` is answered with a single-stream download: the client detects the full-body answer and degrades without an error.",
+    },
+    ScenarioDoc {
+        id: "static-host",
+        name: "Bare static host.",
+        behavior: &[
+            "`GET` and `HEAD` serve the stored bytes, a single open `Range: bytes=N-` answered with `206` and `Content-Range`, an out-of-range start with `416`.",
+            "Every write is refused with `405`, `Allow: GET,HEAD` and no body, before the store is touched.",
+            "Every `/service/rest/` path answers `404`: the host serves files and has no Nexus management or search API.",
+        ],
+        invariant: "The read profile works on a host that is not Nexus: reads, ranges and resumes land, a write is the read-only refusal (exit 1), and the search-backed enumeration refuses with cannot enumerate instead of inventing names.",
     },
     ScenarioDoc {
         id: "audit-litter",

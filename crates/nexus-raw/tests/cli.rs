@@ -757,6 +757,188 @@ fn down_segments_bounds_are_misuse() {
     assert!(stderr(&out).contains("segments"), "{}", stderr(&out));
 }
 
+/// The segmented GET's HEAD is a transfer request: a 503 on it rides the retry
+/// loop instead of failing the run after one attempt.
+#[test]
+fn get_segments_retries_a_flaky_head() {
+    let srv = server(Scenario::Flaky { first_failures: 1 });
+    let content: Vec<u8> = (0..40_000u32).map(|i| (i % 251) as u8).collect();
+    srv.insert("1.14.0/big.bin", &content);
+    let dst = TempDir::new().unwrap();
+    let out = dst.path().join("big.bin");
+    let get = nxr(&[
+        "get",
+        &format!("{}1.14.0/big.bin", srv.base_url()),
+        "--segments",
+        "4",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    expect_exit(&get, 0, "the 503 on the HEAD retries");
+    assert_eq!(std::fs::read(&out).unwrap(), content);
+    let heads: Vec<_> = srv
+        .requests()
+        .into_iter()
+        .filter(|r| r.method == "HEAD")
+        .collect();
+    assert_eq!(heads.len(), 2, "one 503 and one retried HEAD: {heads:?}");
+    assert!(
+        matches!(heads[0].outcome, Outcome::Status(503)),
+        "{heads:?}"
+    );
+}
+
+/// A 401 on the segmented HEAD is the auth verdict, the class the range GETs
+/// take, not a generic HTTP status: exit 3 with the credentials hint.
+#[test]
+fn get_segments_auth_refusal_is_the_auth_verdict() {
+    let srv = server(Scenario::Auth401 {
+        user: "nexus".into(),
+        pass: "secret".into(),
+    });
+    srv.insert("file.bin", BETA);
+    let dst = TempDir::new().unwrap();
+    let out = dst.path().join("file.bin");
+    let get = nxr(&[
+        "--retry",
+        "1",
+        "get",
+        "--segments",
+        "2",
+        &format!("{}file.bin", root_url(&srv)),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    expect_exit(&get, 3, "a 401 is the auth class");
+    let err = stderr(&get);
+    assert!(
+        err.contains("pass -u"),
+        "the auth hint, not the path hint: {err}"
+    );
+    assert!(!out.exists());
+}
+
+/// The tree listing carries the search facts it already fetched: a file row
+/// names its size and sha256, a folder row has neither, and markers stay hidden.
+#[test]
+fn ls_json_carries_the_search_facts() {
+    let srv = server(Scenario::Atomic);
+    let page = format!(
+        r#"{{"continuationToken":null,"items":[
+            {{"path":"1.14.0/app.zip","fileSize":{},"checksum":{{"sha256":"{}"}}}},
+            {{"path":"1.14.0/bom/x.json","fileSize":{},"checksum":{{"sha256":"{}"}}}},
+            {{"path":"1.14.0/app.zip.sha256","fileSize":100,"checksum":{{"sha256":"{}"}}}}
+        ]}}"#,
+        ALPHA.len(),
+        hex_digest(ALPHA),
+        BETA.len(),
+        hex_digest(BETA),
+        hex_digest(ALPHA),
+    );
+    srv.insert("service/rest/v1/search/assets", page.as_bytes());
+
+    let out = nxr(&["--json", "ls", &repo_dir_url(&srv)]);
+    expect_exit(&out, 0, "the listing");
+    let lines = ndjson(&out);
+    let file = lines
+        .iter()
+        .find(|l| l["entry"] == "app.zip")
+        .expect("the file row");
+    assert_eq!(file["kind"], "file");
+    assert_eq!(file["size"], ALPHA.len());
+    assert_eq!(file["sha256"], hex_digest(ALPHA));
+
+    let dir = lines
+        .iter()
+        .find(|l| l["entry"] == "bom")
+        .expect("the dir row");
+    assert_eq!(dir["kind"], "dir");
+    assert!(dir.get("size").is_none(), "a folder has no size: {dir}");
+    assert!(dir.get("sha256").is_none(), "a folder has no digest: {dir}");
+
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l["entry"].as_str().is_some_and(|n| n.ends_with(".sha256"))),
+        "markers stay hidden: {lines:?}"
+    );
+}
+
+/// A name the server holds outside the artifact grammar is not transferable:
+/// `ls --assets` leaves it out and names the count, so the short listing is a
+/// fact.
+#[test]
+fn ls_assets_names_the_count_outside_the_grammar() {
+    let srv = server(Scenario::SearchLag { lag_ms: 0 });
+    srv.insert("1.14.0/a.bin", ALPHA);
+    srv.insert("1.14.0/sp file.bin", BETA);
+    // The scenario's index answers the store only after the first storage PUT.
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "z.bin", GAMMA);
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &dir_url(&srv)]),
+        0,
+        "seeding up arms the index",
+    );
+
+    let base = format!("{}repository/raw-main/1.14.0/", srv.base_url());
+    let out = nxr(&["ls", &base, "--assets"]);
+    expect_exit(&out, 0, "the listing still succeeds");
+    let text = stdout(&out);
+    assert!(text.contains("a.bin"), "{text}");
+    assert!(!text.contains("sp file.bin"), "{text}");
+    assert!(
+        text.contains("outside the artifact grammar"),
+        "the count is named: {text}"
+    );
+
+    let json = nxr(&["ls", &base, "--assets", "--json"]);
+    expect_exit(&json, 0, "the json listing");
+    let hidden = stdout(&json)
+        .lines()
+        .find(|l| l.contains("\"event\":\"hidden\""))
+        .expect("a hidden event")
+        .to_owned();
+    assert!(hidden.contains("\"reason\":\"grammar\""), "{hidden}");
+    assert!(hidden.contains("\"count\":1"), "{hidden}");
+}
+
+/// A transfer that leaves out a name outside the grammar says so: the warning
+/// names the count on stderr, and the valid names still land.
+#[test]
+fn down_ls_warns_about_names_outside_the_grammar() {
+    let srv = server(Scenario::SearchLag { lag_ms: 0 });
+    srv.insert("repository/raw-main/1.14.0/a.bin", ALPHA);
+    srv.insert("repository/raw-main/1.14.0/sp file.bin", BETA);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "z.bin", GAMMA);
+    let base = format!("{}repository/raw-main/1.14.0/", srv.base_url());
+    // The scenario's index answers the store only after the first storage PUT.
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &base]),
+        0,
+        "seeding up arms the index",
+    );
+
+    let dst = TempDir::new().unwrap();
+    let down = nxr(&["down", &base, dst.path().to_str().unwrap(), "--ls"]);
+    expect_exit(&down, 0, "the valid names download");
+    let err = stderr(&down);
+    assert!(
+        err.contains("warning:"),
+        "a warning line is required: {err}"
+    );
+    assert!(
+        err.contains("outside the artifact grammar"),
+        "the warning names the cause: {err}"
+    );
+    assert!(dst.path().join("a.bin").is_file(), "the valid name lands");
+    assert!(
+        !dst.path().join("sp file.bin").exists(),
+        "the untransferable name never lands"
+    );
+}
+
 // ---- clone ----------------------------------------------------------------
 
 fn clone_repo_url(srv: &MockNexus) -> String {
@@ -798,6 +980,80 @@ fn clone_copies_a_repository_and_skips_on_the_second_run() {
     );
 }
 
+/// `clone --state FILE` keeps the cache where it is named, `--no-state` writes
+/// none, and the pair together is misuse.
+#[test]
+fn clone_state_flags_choose_the_cache() {
+    let srv = server(Scenario::SearchLag { lag_ms: 0 });
+    let base = clone_repo_url(&srv);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "a.zip", ALPHA);
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &base]),
+        0,
+        "seeding up",
+    );
+
+    let dst = TempDir::new().unwrap();
+    let cache = dst.path().join("cache.json");
+    let out = nxr(&[
+        "clone",
+        &base,
+        dst.path().to_str().unwrap(),
+        "--state",
+        cache.to_str().unwrap(),
+    ]);
+    expect_exit(&out, 0, "clone --state");
+    assert!(cache.is_file(), "the cache lands at the named path");
+    assert!(
+        !dst.path().join(".nxr-state.json").exists(),
+        "the default cache is not written beside it"
+    );
+
+    let bare = TempDir::new().unwrap();
+    let out = nxr(&["clone", &base, bare.path().to_str().unwrap(), "--no-state"]);
+    expect_exit(&out, 0, "clone --no-state");
+    assert!(
+        !bare.path().join(".nxr-state.json").exists(),
+        "no cache with --no-state"
+    );
+
+    let both = nxr(&[
+        "clone",
+        &base,
+        dst.path().to_str().unwrap(),
+        "--state",
+        cache.to_str().unwrap(),
+        "--no-state",
+    ]);
+    expect_exit(&both, 2, "the pair is misuse");
+}
+
+/// `clone` creates a missing destination, the way `down` does: a fresh path is
+/// the normal case, and the part files must not fail on it.
+#[test]
+fn clone_creates_a_missing_destination() {
+    let srv = server(Scenario::SearchLag { lag_ms: 0 });
+    let base = clone_repo_url(&srv);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "a.zip", ALPHA);
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &base]),
+        0,
+        "seeding up",
+    );
+
+    let holder = TempDir::new().unwrap();
+    let nested = holder.path().join("fresh/deep");
+    let out = nxr(&["clone", &base, nested.to_str().unwrap()]);
+    expect_exit(&out, 0, "clone creates the destination");
+    assert_eq!(read_file(&nested, "a.zip"), ALPHA);
+    assert!(
+        nested.join(".nxr-state.json").is_file(),
+        "the default cache lands in the new destination"
+    );
+}
+
 /// `clone --plan` prints the actions and writes nothing.
 #[test]
 fn clone_plan_writes_nothing() {
@@ -819,6 +1075,73 @@ fn clone_plan_writes_nothing() {
         std::fs::read_dir(dst.path()).unwrap().count(),
         0,
         "a plan writes nothing"
+    );
+}
+
+/// A local copy whose bytes match the remote but whose marker is gone gets the
+/// marker sealed back, with no transfer.
+#[test]
+fn clone_seals_a_markerless_local_copy() {
+    let srv = server(Scenario::SearchLag { lag_ms: 0 });
+    let base = clone_repo_url(&srv);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "a.zip", ALPHA);
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &base]),
+        0,
+        "seeding up",
+    );
+
+    let dst = TempDir::new().unwrap();
+    expect_exit(
+        &nxr(&["clone", &base, dst.path().to_str().unwrap()]),
+        0,
+        "the first clone",
+    );
+    std::fs::remove_file(dst.path().join("a.zip.sha256")).unwrap();
+
+    // `--plan` names the seal explicitly and writes nothing.
+    let plan = nxr(&[
+        "--json",
+        "clone",
+        "--plan",
+        "--no-state",
+        &base,
+        dst.path().to_str().unwrap(),
+    ]);
+    expect_exit(&plan, 0, "the sealing plan");
+    assert!(
+        stdout(&plan).contains(r#"{"name":"a.zip","plan":"seal"}"#),
+        "the plan line is the seal: {}",
+        stdout(&plan)
+    );
+    assert!(
+        !dst.path().join("a.zip.sha256").exists(),
+        "--plan writes nothing"
+    );
+
+    let out = nxr(&[
+        "--json",
+        "clone",
+        "--no-state",
+        &base,
+        dst.path().to_str().unwrap(),
+    ]);
+    expect_exit(&out, 0, "the sealing rerun");
+    assert!(
+        dst.path().join("a.zip.sha256").is_file(),
+        "the marker is written back"
+    );
+    let text = stdout(&out);
+    // The run's plan event is the transfer projection: a seal is not a
+    // transfer, so the name rides `skip` there and the summary counts it.
+    assert!(
+        text.contains(r#""skip":["a.zip"]"#),
+        "the projection names it: {text}"
+    );
+    assert!(
+        text.contains(r#""sealed":1"#),
+        "the summary counts it: {text}"
     );
 }
 
@@ -885,6 +1208,35 @@ fn down_names_from_file() {
     expect_exit(&down, 0, "down --names-from file");
     assert_eq!(read_file(dst.path(), "a.zip"), ALPHA);
     assert_eq!(read_file(dst.path(), "b.bin"), BETA);
+}
+
+/// The transfer URL may be the repository root: a flat repository with no
+/// version directories uploads and downloads by name.
+#[test]
+fn up_and_down_work_at_the_repository_root() {
+    let srv = server(Scenario::Atomic);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "flat.bin", ALPHA);
+    let root = format!("{}repository/raw-main/", srv.base_url());
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &root]),
+        0,
+        "up at the repository root",
+    );
+
+    let list = TempDir::new().unwrap();
+    let list_path = list.path().join("names.txt");
+    std::fs::write(&list_path, "flat.bin\n").unwrap();
+    let dst = TempDir::new().unwrap();
+    let down = nxr(&[
+        "down",
+        &root,
+        dst.path().to_str().unwrap(),
+        "--names-from",
+        list_path.to_str().unwrap(),
+    ]);
+    expect_exit(&down, 0, "down at the repository root");
+    assert_eq!(read_file(dst.path(), "flat.bin"), ALPHA);
 }
 
 /// `--names-from -` reads the name list from stdin.
@@ -1210,6 +1562,102 @@ fn get_continue_refuses_a_symlinked_part() {
     );
     assert_eq!(std::fs::read(&protected).unwrap(), b"keep me");
     assert!(!target.exists(), "no output is renamed from a symlink");
+}
+
+/// A segmented download on a server that ignores `Range` degrades to the single
+/// stream and still lands the object whole.
+#[test]
+fn down_segments_falls_back_when_range_is_ignored() {
+    let srv = server(Scenario::IgnoreRange);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "a.bin", ALPHA);
+    let base = dir_url(&srv);
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &base]),
+        0,
+        "seeding up",
+    );
+    let dst = TempDir::new().unwrap();
+    let out = nxr(&[
+        "down",
+        &base,
+        dst.path().to_str().unwrap(),
+        "--name",
+        "a.bin",
+        "--segments",
+        "4",
+    ]);
+    expect_exit(&out, 0, "the segmented down falls back to one stream");
+    assert_eq!(read_file(dst.path(), "a.bin"), ALPHA);
+}
+
+/// A server that answers the ranged resume with the whole body must not append
+/// that body after the part: the client restarts and lands the object whole.
+#[test]
+fn get_continue_restarts_when_the_server_ignores_range() {
+    let srv = server(Scenario::IgnoreRange);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "a.bin", ALPHA);
+    let dir = format!("{}repository/raw-main/", srv.base_url());
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &dir]),
+        0,
+        "publishing seeds the marker the resume is checked against",
+    );
+
+    let out = TempDir::new().unwrap();
+    std::fs::write(out.path().join("a.bin.part"), b"PART").unwrap();
+    let target = out.path().join("a.bin");
+    let got = nxr(&[
+        "get",
+        "--continue",
+        &format!("{dir}a.bin"),
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    expect_exit(&got, 0, "the single-stream fallback still lands the object");
+    assert_eq!(
+        read_file(out.path(), "a.bin"),
+        ALPHA,
+        "the whole body replaced the stale prefix instead of following it"
+    );
+}
+
+/// A stale part of the same length is not trusted: the resumed content is hashed
+/// against the server's `.sha256` and a divergence is refused, never renamed.
+#[test]
+fn get_continue_refuses_a_diverged_part() {
+    let srv = server(Scenario::Atomic);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "obj.bin", b"PAYLOAD");
+    let dir = format!("{}repository/raw-main/", srv.base_url());
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &dir]),
+        0,
+        "publishing seeds the marker the resume is checked against",
+    );
+
+    let out = TempDir::new().unwrap();
+    let target = out.path().join("obj.bin");
+    let part = out.path().join("obj.bin.part");
+    // Same length as the object, different bytes: only the digest can tell.
+    std::fs::write(&part, b"WRONG12").unwrap();
+    let url = format!("{dir}obj.bin");
+    let got = nxr(&["get", "--continue", &url, "-o", target.to_str().unwrap()]);
+    expect_exit(&got, 1, "a diverged resume is a data verdict");
+    assert!(
+        stderr(&got).contains("resumed content diverges"),
+        "the divergence is named: {}",
+        stderr(&got)
+    );
+    assert!(
+        !target.exists(),
+        "a diverged resume is never renamed into place"
+    );
+    assert!(
+        !part.exists(),
+        "the poisoned part is removed, so a rerun starts clean"
+    );
 }
 
 /// A part longer than the object answers 416: the client must prove it holds
@@ -1549,6 +1997,21 @@ fn verify_accepts_then_rejects_tampering() {
 
     let bad = nxr(&["verify", src.path().to_str().unwrap()]);
     expect_exit(&bad, 1, "verify of tampered bytes");
+}
+
+/// A stray part file names its repair: it is staging from an interrupted
+/// transfer, and the refusal says to finish or delete it, not just the suffix rule.
+#[test]
+fn verify_on_a_stray_part_names_the_repair() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("b.bin.part"), b"PART").unwrap();
+    let out = nxr(&["verify", dir.path().to_str().unwrap()]);
+    expect_exit(&out, 2, "a reserved local name is misuse");
+    assert!(
+        stderr(&out).contains("finish or delete the interrupted transfer's part file"),
+        "the repair is named: {}",
+        stderr(&out)
+    );
 }
 
 // ---- exit-code matrix -----------------------------------------------------
@@ -2666,6 +3129,87 @@ fn ndjson_events_parse_and_summarize() {
 
 // ---- golden ndjson --------------------------------------------------------
 
+/// The `mv --json` composition is golden: the pour's events and summary, then
+/// the delete's events and summary, one stream.
+#[test]
+fn golden_ndjson_mv_holds() {
+    let srv = server(Scenario::SearchLag { lag_ms: 0 });
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "a.zip", ALPHA);
+    let from = format!("{}1.0.0/", clone_repo_url(&srv));
+    let to = format!("{}2.0.0/", clone_repo_url(&srv));
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &from]),
+        0,
+        "seeding the mv fixture",
+    );
+
+    let out = nxr(&["--json", "mv", &from, &to, "--ls", "--yes"]);
+    expect_exit(&out, 0, "golden mv");
+    assert_eq!(
+        stdout(&out),
+        golden("mv.ndjson"),
+        "the mv ndjson changed: update tests/golden/mv.ndjson deliberately"
+    );
+}
+
+/// The `clone --plan --json` shape is golden: one line per name with the plan
+/// and, for a transfer, the size.
+#[test]
+fn golden_ndjson_clone_plan_holds() {
+    let srv = server(Scenario::SearchLag { lag_ms: 0 });
+    let repo = clone_repo_url(&srv);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "a.zip", ALPHA);
+    std::fs::create_dir_all(src.path().join("sub")).unwrap();
+    write_file(&src.path().join("sub"), "b.bin", BETA);
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &repo]),
+        0,
+        "seeding the clone plan fixture",
+    );
+
+    let dst = TempDir::new().unwrap();
+    let out = nxr(&[
+        "--json",
+        "clone",
+        "--plan",
+        &repo,
+        dst.path().to_str().unwrap(),
+    ]);
+    expect_exit(&out, 0, "golden clone plan");
+    assert_eq!(
+        stdout(&out),
+        golden("clone-plan.ndjson"),
+        "the clone plan ndjson changed: update tests/golden/clone-plan.ndjson deliberately"
+    );
+}
+
+/// The `ls --json` shape is golden: the hidden count of the listed directory, a
+/// folder row, and a file row carrying the search facts.
+#[test]
+fn golden_ndjson_ls_holds() {
+    let srv = server(Scenario::SearchLag { lag_ms: 0 });
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "a.zip", ALPHA);
+    std::fs::create_dir_all(src.path().join("sub")).unwrap();
+    write_file(&src.path().join("sub"), "b.bin", BETA);
+    let repo = clone_repo_url(&srv);
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &repo]),
+        0,
+        "seeding the ls fixture",
+    );
+
+    let ls = nxr(&["--json", "ls", &repo]);
+    expect_exit(&ls, 0, "golden ls");
+    assert_eq!(
+        stdout(&ls),
+        golden("ls.ndjson"),
+        "the ls ndjson changed: update tests/golden/ls.ndjson deliberately"
+    );
+}
+
 /// The --json surface is a contract, pinned byte-exact by fixtures in tests/golden/.
 /// One artifact per run keeps chunk events deterministic.
 /// No URL reaches these outputs, so the bytes carry no ports.
@@ -2935,6 +3479,9 @@ fn golden(name: &str) -> String {
         "failures.ndjson" => include_str!("golden/failures.ndjson"),
         "rm.ndjson" => include_str!("golden/rm.ndjson"),
         "audit.ndjson" => include_str!("golden/audit.ndjson"),
+        "ls.ndjson" => include_str!("golden/ls.ndjson"),
+        "clone-plan.ndjson" => include_str!("golden/clone-plan.ndjson"),
+        "mv.ndjson" => include_str!("golden/mv.ndjson"),
         _ => unreachable!("the golden table and the fixture name drift together"),
     }
     .replace("\r\n", "\n")
@@ -3155,6 +3702,31 @@ fn failing_up_still_flushes_ndjson_events() {
 }
 
 /// doctor: missing credentials are a warning (exit 0), explicit credentials pass clean (exit 0).
+/// A locally edited artifact whose marker still pins the old digest is refused,
+/// and the error names the fix: delete the stale sibling.
+#[test]
+fn a_stale_local_marker_names_the_fix() {
+    let srv = server(Scenario::Atomic);
+    let base = dir_url(&srv);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "a.zip", ALPHA);
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &base]),
+        0,
+        "seed the pair",
+    );
+    // The bytes change, the marker does not.
+    write_file(src.path(), "a.zip", BETA);
+    let out = nxr(&["up", src.path().to_str().unwrap(), &base]);
+    expect_exit(&out, 1, "the stale local pair is a refusal");
+    let err = stderr(&out);
+    assert!(err.contains("local object is broken"), "{err}");
+    assert!(
+        err.contains("Delete the stale sibling"),
+        "the fix is named: {err}"
+    );
+}
+
 /// A broken setting (retry 0) is a failure (exit 2).
 #[test]
 fn doctor_exit_codes() {
@@ -3447,6 +4019,49 @@ fn rm_readonly_refuses_and_keeps_bytes() {
         r.method == "DELETE" && matches!(r.outcome, mock_nexus::Outcome::Status(200..=300))
     });
     assert!(!successful, "no DELETE may succeed");
+}
+
+/// A bare static host: reads land, a write is the read-only refusal (exit 1),
+/// and the search-backed listing refuses with cannot enumerate.
+#[test]
+fn static_host_reads_and_refuses_writes() {
+    let srv = server(Scenario::StaticHost);
+    srv.insert("1.14.0/a.zip", ALPHA);
+    srv.insert(
+        "1.14.0/a.zip.sha256",
+        marker_line("a.zip", ALPHA).as_bytes(),
+    );
+    let base = dir_url(&srv);
+
+    let dst = TempDir::new().unwrap();
+    let down = nxr(&[
+        "down",
+        &base,
+        dst.path().to_str().unwrap(),
+        "--name",
+        "a.zip",
+    ]);
+    expect_exit(&down, 0, "reads work on a static host");
+    assert_eq!(read_file(dst.path(), "a.zip"), ALPHA);
+
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "z.bin", GAMMA);
+    let up = nxr(&["up", src.path().to_str().unwrap(), &base]);
+    expect_exit(&up, 1, "a static host refuses writes as read-only");
+    let err = stderr(&up);
+    assert!(
+        err.contains("read-only"),
+        "the error names the refusal: {err}"
+    );
+
+    let repo = format!("{}repository/raw-main/1.14.0/", srv.base_url());
+    let ls = nxr(&["ls", &repo, "--assets"]);
+    expect_exit(&ls, 1, "the search API is absent");
+    assert!(
+        stderr(&ls).contains("cannot enumerate"),
+        "the listing refuses with the enumeration hint: {}",
+        stderr(&ls)
+    );
 }
 
 /// rm plans by default: the plan prints and the mock counts zero DELETEs.
@@ -3765,7 +4380,9 @@ fn diff_equal_directory_exits_zero() {
     expect_exit(&named, 0, "an equal named diff is exit 0");
 }
 
-/// `--prefix` keeps only whole-segment matches on both sides.
+/// `--prefix` keeps only whole-segment matches on both sides, the local-only
+/// entries included: the enumeration filter alone would leave a name the remote
+/// does not have as `missing-remote`.
 #[test]
 fn diff_prefix_filters_both_sides() {
     let srv = server(Scenario::Atomic);
@@ -3773,8 +4390,11 @@ fn diff_prefix_filters_both_sides() {
     let local = TempDir::new().unwrap();
     std::fs::create_dir_all(local.path().join("a")).unwrap();
     std::fs::create_dir_all(local.path().join("b")).unwrap();
+    std::fs::create_dir_all(local.path().join("c")).unwrap();
     write_file(local.path(), "a/x.bin", ALPHA);
     write_file(local.path(), "b/y.bin", BETA);
+    // Local only: never uploaded, so only the local scan knows it.
+    write_file(local.path(), "c/z.bin", GAMMA);
     expect_exit(
         &nxr(&["up", local.path().to_str().unwrap(), &base]),
         0,
@@ -3796,6 +4416,27 @@ fn diff_prefix_filters_both_sides() {
     let text = stdout(&out);
     assert!(text.contains("same a/x.bin"), "{text}");
     assert!(!text.contains("b/y.bin"), "the other prefix is out: {text}");
+    assert!(
+        !text.contains("c/z.bin"),
+        "a local-only name outside the prefix is filtered too: {text}"
+    );
+
+    // The control: without the prefix, the local-only name reports as missing.
+    let all = nxr(&[
+        "diff",
+        local.path().to_str().unwrap(),
+        &base,
+        "--name",
+        "a/x.bin",
+        "--name",
+        "b/y.bin",
+    ]);
+    expect_exit(&all, 1, "a local-only name is a difference");
+    assert!(
+        stdout(&all).contains("c/z.bin"),
+        "the local-only name reports without a prefix: {}",
+        stdout(&all)
+    );
 }
 
 /// `diff` prints one line per entry and changes nothing on either side.
@@ -4237,6 +4878,41 @@ fn mv_refused_delete_leaves_a_duplicate() {
     assert_eq!(member.store_get("1.14.0/a.zip").unwrap(), ALPHA);
 }
 
+/// A group refuses every write with 405: `up` exits 1 with the read-only hint
+/// naming the group, and no member ever sees a write.
+#[test]
+fn up_to_a_group_refuses_as_read_only() {
+    let member = server(Scenario::Atomic);
+    let group = MockNexus::start_group(&[&member, &server(Scenario::Atomic)]).unwrap();
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "a.zip", ALPHA);
+
+    let up = nxr(&["up", src.path().to_str().unwrap(), &dir_url(&group)]);
+    expect_exit(
+        &up,
+        1,
+        "a refused write is the read-only verdict, not the transport class",
+    );
+    let err = stderr(&up);
+    assert!(
+        err.contains("read-only"),
+        "the error names the refusal: {err}"
+    );
+    assert!(
+        err.contains("group"),
+        "the hint names the group repository: {err}"
+    );
+    assert!(
+        !err.contains("pass -u"),
+        "a refused write must not send the user to credentials: {err}"
+    );
+    assert!(
+        member.requests().iter().all(|r| r.method != "PUT"),
+        "a group write must not reach a member: {:?}",
+        member.requests()
+    );
+}
+
 // ---- service repos ---------------------------------------------------------
 
 /// `service repos` prints one `name format kind url` line per repository.
@@ -4422,6 +5098,34 @@ fn service_eula_accept_refusal_is_an_auth_error() {
     let out = nxr(&["service", "eula", &srv.base_url(), "--accept"]);
     expect_exit(&out, 3, "a refused acceptance is a transport/auth class");
     assert!(stderr(&out).contains("hint:"), "got: {}", stderr(&out));
+}
+
+/// `service repo --detail` reads the admin-only settings through one GET and
+/// prints them under the summary line, the shape `cli.md` documents.
+#[test]
+fn service_repo_detail_prints_the_admin_settings() {
+    let srv = server(Scenario::RepoDetailAdmin {
+        user: "admin".into(),
+        pass: "pw".into(),
+    });
+    let url = format!("{}repository/raw-main/", srv.base_url());
+    let out = nxr(&["service", "repo", &url, "--detail", "-u", "admin:pw"]);
+    expect_exit(&out, 0, "the admin detail");
+    let text = stdout(&out);
+    assert!(text.contains("(full settings follow)"), "{text}");
+    assert!(text.contains("blobStoreName"), "the settings print: {text}");
+    assert!(!text.contains("pw"), "credentials never print: {text}");
+
+    let json = nxr(&[
+        "--json", "service", "repo", &url, "--detail", "-u", "admin:pw",
+    ]);
+    expect_exit(&json, 0, "the json detail");
+    let value: serde_json::Value = serde_json::from_str(&stdout(&json)).expect("one object");
+    assert_eq!(value["name"], "raw-main");
+    assert_eq!(
+        value["detail"]["storage"]["blobStoreName"], "default",
+        "the settings ride the same object: {value}"
+    );
 }
 
 /// `service eula` on a server without the gate reports gate:false and exits zero.
@@ -4700,6 +5404,60 @@ fn ls_scopes_the_search_to_the_directory() {
     );
 }
 
+/// Two served paths that decode to one name give the row no facts at all: one
+/// object's size on the other object's name would be a lie.
+#[test]
+fn ls_json_drops_the_facts_of_a_decoded_collision() {
+    let srv = server(Scenario::Atomic);
+    let page = format!(
+        r#"{{"continuationToken":null,"items":[
+            {{"path":"1.14.0/a b.zip","fileSize":10,"checksum":{{"sha256":"{}"}}}},
+            {{"path":"1.14.0/a%20b.zip","fileSize":20,"checksum":{{"sha256":"{}"}}}}
+        ]}}"#,
+        hex_digest(ALPHA),
+        hex_digest(BETA),
+    );
+    srv.insert("service/rest/v1/search/assets", page.as_bytes());
+
+    let out = nxr(&["--json", "ls", &repo_dir_url(&srv)]);
+    expect_exit(&out, 0, "the listing");
+    let lines = ndjson(&out);
+    let rows: Vec<_> = lines.iter().filter(|l| l["kind"] == "file").collect();
+    assert_eq!(rows.len(), 1, "one decoded name, one row: {lines:?}");
+    assert_eq!(rows[0]["entry"], "a b.zip");
+    assert!(
+        rows[0].get("size").is_none() && rows[0].get("sha256").is_none(),
+        "a collision carries no facts: {}",
+        rows[0]
+    );
+}
+
+/// The generated search pages carry the real `fileSize` field, and a file row
+/// reaches `ls --json` with the size and the digest the index reported.
+#[test]
+fn ls_json_reads_the_generated_file_size() {
+    let srv = server(Scenario::AssetsPrefixQ);
+    let out = nxr(&[
+        "--json",
+        "ls",
+        &format!("{}repository/raw-main/v1.1.0-dir/", srv.base_url()),
+    ]);
+    expect_exit(&out, 0, "the scoped listing");
+    let lines = ndjson(&out);
+    let file = lines
+        .iter()
+        .find(|l| l["kind"] == "file")
+        .expect("a file row");
+    assert!(
+        file["size"].as_u64().is_some_and(|s| s >= 1000),
+        "the size reaches the row: {file}"
+    );
+    assert!(
+        file["sha256"].as_str().is_some_and(|s| s.len() == 64),
+        "the digest reaches the row: {file}"
+    );
+}
+
 /// The server's `q` is loose (a path substring), the client's `--prefix` is exact: a value
 /// without the trailing slash drags the name-continuing sibling in, the measured
 /// `bench/flat` against `bench/flat2` case, and the whole-segment prefix drops it again.
@@ -4768,8 +5526,8 @@ fn seed_via_search_fixture(srv: &MockNexus) -> (String, tempfile::TempDir) {
     // sizes, the shape a real Nexus serves. Paths are repository-absolute.
     let page = format!(
         r#"{{"continuationToken":null,"items":[
-            {{"path":"1.14.0/a.zip","size":{},"checksum":{{"sha256":"{}"}}}},
-            {{"path":"1.14.0/b.zip","size":{},"checksum":{{"sha256":"{}"}}}}
+            {{"path":"1.14.0/a.zip","fileSize":{},"checksum":{{"sha256":"{}"}}}},
+            {{"path":"1.14.0/b.zip","fileSize":{},"checksum":{{"sha256":"{}"}}}}
         ]}}"#,
         ALPHA.len(),
         hex_digest(ALPHA),
@@ -4865,6 +5623,87 @@ fn via_search_matches_plain_diff_and_needs_one_listing() {
     );
 }
 
+/// The store-backed search page carries the uploaded marker's digest, so the
+/// index a lagging server eventually serves is enough for `diff --via search`
+/// to return the same verdict the probes would: equal names, no false divergence.
+#[test]
+fn via_search_reads_the_store_backed_facts() {
+    let srv = server(Scenario::SearchLag { lag_ms: 0 });
+    let local = tempfile::TempDir::new().unwrap();
+    write_file(local.path(), "a.zip", ALPHA);
+    write_file(local.path(), "b.zip", BETA);
+    let base = repo_dir_url(&srv);
+    expect_exit(
+        &nxr(&["up", local.path().to_str().unwrap(), &base]),
+        0,
+        "the upload arms the index and stores the markers",
+    );
+    let out = nxr(&[
+        "diff",
+        local.path().to_str().unwrap(),
+        &base,
+        "--via",
+        "search",
+        "--ls",
+    ]);
+    expect_exit(&out, 0, "the store-backed facts are equal");
+    assert_eq!(stdout(&out), "same a.zip\nsame b.zip\n");
+}
+
+/// `--prefix` filters the search-side delta too, a local-only name included:
+/// the remote side is narrowed by the search facts, the local scan is not.
+#[test]
+fn via_search_prefix_filters_local_only_names() {
+    let srv = server(Scenario::Atomic);
+    let local = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(local.path().join("sub")).unwrap();
+    write_file(local.path(), "sub/a.zip", ALPHA);
+    // Local only: never uploaded and never in the search page.
+    write_file(local.path(), "notes.txt", GAMMA);
+    let page = format!(
+        r#"{{"continuationToken":null,"items":[
+            {{"path":"1.14.0/sub/a.zip","fileSize":{},"checksum":{{"sha256":"{}"}}}}
+        ]}}"#,
+        ALPHA.len(),
+        hex_digest(ALPHA),
+    );
+    srv.insert("service/rest/v1/search/assets", page.as_bytes());
+    let base = repo_dir_url(&srv);
+
+    let all = nxr(&[
+        "diff",
+        local.path().to_str().unwrap(),
+        &base,
+        "--via",
+        "search",
+        "--ls",
+    ]);
+    expect_exit(&all, 1, "the local-only name is a difference");
+    let text = stdout(&all);
+    assert!(text.contains("same sub/a.zip"), "{text}");
+    assert!(
+        text.contains("missing-remote notes.txt"),
+        "the unfiltered report names the local-only row: {text}"
+    );
+
+    let filtered = nxr(&[
+        "diff",
+        local.path().to_str().unwrap(),
+        &base,
+        "--via",
+        "search",
+        "--ls",
+        "--prefix",
+        "sub/",
+    ]);
+    expect_exit(&filtered, 0, "the filtered search delta is clean");
+    let text = stdout(&filtered);
+    assert_eq!(
+        text, "same sub/a.zip\n",
+        "the prefix filters both sides: {text}"
+    );
+}
+
 /// A digestless search entry can never read as `same`: the missing fact reports as a divergence.
 #[test]
 fn via_search_digestless_entry_is_not_same() {
@@ -4873,8 +5712,8 @@ fn via_search_digestless_entry_is_not_same() {
     // b.zip loses its checksum line: nothing to verify against anymore.
     let page = format!(
         r#"{{"continuationToken":null,"items":[
-            {{"path":"1.14.0/a.zip","size":{},"checksum":{{"sha256":"{}"}}}},
-            {{"path":"1.14.0/b.zip","size":{}}}
+            {{"path":"1.14.0/a.zip","fileSize":{},"checksum":{{"sha256":"{}"}}}},
+            {{"path":"1.14.0/b.zip","fileSize":{}}}
         ]}}"#,
         ALPHA.len(),
         hex_digest(ALPHA),

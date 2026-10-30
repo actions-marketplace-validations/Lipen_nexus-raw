@@ -15,6 +15,7 @@ nxr-mount https://nexus.example/repository/raw /mnt/nexus
 ```
 
 The URL is the repository directory to mount.
+It must point inside `/repository/<name>/…`: a directory listing needs the repository name from the URL, so a URL outside that shape is refused at startup with exit 2 and the same message `ls` carries, instead of mounting a tree that lists nothing.
 Credentials come from `-u user:pass`, `NXR_AUTH` (base64) or `NXR_USERNAME` + `NXR_PASSWORD`, in that order, exactly like `nxr`.
 `--tls-insecure` skips certificate verification, `--ca-bundle FILE` adds a private CA (also `NXR_CA_BUNDLE`), and `--workers` caps parallel requests and FUSE dispatch threads.
 
@@ -31,6 +32,7 @@ The mount therefore resolves a node in two steps:
    A non-empty listing makes it a directory, an empty one makes the path `ENOENT`.
 
 `.sha256` markers are hidden from listings, exactly as `nxr ls` hides them.
+A name that cannot be one path component (a decoded `/`, a nul byte, a dot segment) is left out too: `lookup` refuses such a name, so a row for it could never open.
 Each name segment is percent-encoded when a repository URL is built, so a foreign name with spaces, `?`, `#`, `%` or unicode resolves.
 
 Reads are lazy and block-cached: one block is `--block-kib` KiB (256 by default), fetched with a ranged GET, and the cache is bounded by `--cache-mib` (256 by default).

@@ -172,7 +172,7 @@ pub fn classify(
             (LocalStatus::Broken(detail), _) => {
                 return Err(Verdict::Mismatch {
                     name: name.to_string(),
-                    detail: format!("local object is broken and must not be overwritten: {detail}"),
+                    detail: crate::model::state::broken_detail(detail),
                 });
             }
             (LocalStatus::Absent, RemoteStatus::Absent) => missing.push(name.to_string()),
@@ -250,11 +250,11 @@ pub fn classify_if_changed(
     for (name, local) in locals {
         let remote = remotes.get(&name).cloned().unwrap_or(RemoteStatus::Absent);
         // A broken local or remote object refuses the name before any relaxation:
-        // `--if-changed` relaxes the divergence rule, never the never-overwrite rule.
+        // `--if-changed` relaxes exactly the complete-pair divergence refusal, and nothing else.
         if let LocalStatus::Broken(detail) = &local {
             return Err(Verdict::Mismatch {
                 name: name.to_string(),
-                detail: format!("local object is broken and must not be overwritten: {detail}"),
+                detail: crate::model::state::broken_detail(detail),
             });
         }
         if let RemoteStatus::Broken(detail) = &remote {

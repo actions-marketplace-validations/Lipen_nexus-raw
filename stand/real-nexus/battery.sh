@@ -152,6 +152,28 @@ for _ in 1 2 3 4 5 6; do
 done
 if [ "$seen" = 1 ]; then ok "ls --assets lists the objects of a version"; else no "ls --assets lists the objects of a version"; fi
 
+# The tree listing carries the search-reported facts: the real index answers a
+# file's size and digest without a HEAD. The index lags, so the listing is polled
+# like the checks above, and one captured run is kept (and printed) when it
+# fails: a diagnostic sees exactly the bytes the check judged.
+seen=0
+for _ in 1 2 3 4 5 6; do
+    if "$NXR" ls "$VER" --json > "$WORK/ls.json" 2> /dev/null &&
+        grep '"entry":"big.bin"' "$WORK/ls.json" | grep -q '"size":2000000' &&
+        grep '"entry":"big.bin"' "$WORK/ls.json" | grep -q '"sha256":"'; then
+        seen=1
+        break
+    fi
+    sleep 2
+done
+if [ "$seen" = 1 ]; then
+    ok "the tree listing carries the real index facts"
+else
+    no "the tree listing carries the real index facts"
+    cp "$WORK/ls.json" "${STAND_ENV:-/tmp/nxr-stand.env}.ls.json" 2> /dev/null || :
+    cat "$WORK/ls.json" >&2 2> /dev/null || :
+fi
+
 # 18-19. Missing objects: head answers, get fails.
 if "$NXR" head "$VER/nope.bin" 2> /dev/null | grep -q 'head: 404'; then
     ok "head reports 404 for a missing object"
@@ -192,6 +214,92 @@ else
     no "the mirrored tree is byte-equal, markers in place"
 fi
 expect_ok "verify passes offline on the mirror" "$NXR" verify "$WORK/dst"
+
+# --- the remaining paths against the real server ---------------------------
+
+# The search-side delta reads the real index (sizes and checksums per asset)
+# once it catches up: the mirrored copy and the storage agree on every name.
+seen=0
+for _ in 1 2 3 4 5 6; do
+    if "$NXR" diff "$WORK/orig" "$VER" --via search --ls > "$WORK/diff-search.txt" 2> /dev/null; then
+        seen=1
+        break
+    fi
+    sleep 2
+done
+if [ "$seen" = 1 ] && ! grep -qE '^(missing|diverged)' "$WORK/diff-search.txt"; then
+    ok "diff --via search reads the real index as equal"
+else
+    no "diff --via search reads the real index as equal"
+fi
+
+# The segmented read against a real 206 answer: four spans, one byte-equal file.
+expect_ok "get --segments reassembles the real partial-content answer" bash -c "\"$NXR\" get '$VER/big.bin' -o '$WORK/seg-big.bin' --segments 4 && cmp -s '$WORK/orig/big.bin' '$WORK/seg-big.bin'"
+
+# The put primitive: bytes plus the marker of the same name in one call.
+printf 'put bytes\n' > "$WORK/put.bin"
+expect_ok "put writes one object with its marker" "$NXR" put "$VER/put.bin" -f "$WORK/put.bin" --sha
+expect_ok "get returns the put bytes" bash -c "\"$NXR\" get '$VER/put.bin' -o '$WORK/put-got.bin' && cmp -s '$WORK/put.bin' '$WORK/put-got.bin'"
+
+# clone the version through the search API, then re-run with --verify: the
+# second run re-hashes the local tree and downloads nothing, and the clone
+# verifies offline.
+# The index lags the writes, and a name the first clone missed would arrive in
+# the second run as a download: wait for the last uploaded name first, so both
+# runs enumerate the same set.
+seen=0
+for _ in 1 2 3 4 5 6; do
+    if "$NXR" ls "$VER" --assets 2> /dev/null | grep -q 'put.bin'; then
+        seen=1
+        break
+    fi
+    sleep 2
+done
+if [ "$seen" = 1 ]; then
+    ok "the index catches up before the clone"
+else
+    no "the index catches up before the clone"
+fi
+expect_ok "clone mirrors the version" "$NXR" clone "$VER" "$WORK/clone" --workers 4
+expect_ok "clone --verify re-hashes and skips" bash -c "\"$NXR\" clone '$VER' '$WORK/clone' --verify > '$WORK/clone2.txt' && grep -q 'downloaded 0' '$WORK/clone2.txt'"
+expect_ok "verify passes on the clone" "$NXR" verify "$WORK/clone"
+
+# audit --bytes hashes every object against its marker on a real index.
+expect_ok "audit --bytes finds no bitrot" "$NXR" audit "$VER" --bytes
+
+# doctor --deep runs its probes (version, range, content-length, search, repo
+# type, eula) against the real server and reports no failure.
+expect_ok "doctor --deep passes on the real server" "$NXR" doctor "$VER" --deep
+
+# A new name goes up and the index poll sees it: --wait-index holds the run
+# until the real search API answers with every uploaded name.
+printf 'wait for me\n' > "$WORK/src/waited.bin"
+expect_ok "up --wait-index waits for the real index" bash -c "\"$NXR\" up '$WORK/src' '$VER' --wait-index --json > '$WORK/wait.jsonl' && grep -q '\"timeout\":false' '$WORK/wait.jsonl'"
+
+# The one-span read against the real server: the returned bytes equal the
+# source prefix.
+expect_ok "get --range reads one span" bash -c "\"$NXR\" get '$VER/big.bin' --range 0-99 -o '$WORK/span.bin' && head -c 100 '$WORK/orig/big.bin' | cmp -s - '$WORK/span.bin'"
+
+# --if-changed on a converged tree skips everything: every remote marker
+# already matches the local copy.
+if out=$("$NXR" up "$WORK/src" "$VER" --if-changed -q 2> /dev/null) && printf '%s' "$out" | grep -q 'uploaded 0'; then
+    ok "up --if-changed skips a converged tree"
+else
+    no "up --if-changed skips a converged tree"
+fi
+
+# The segmented download against the same real 206 answer.
+expect_ok "down --segments reassembles a real 206 answer" bash -c "\"$NXR\" down '$VER' '$WORK/seg-down' --name big.bin --segments 4 && cmp -s '$WORK/orig/big.bin' '$WORK/seg-down/big.bin'"
+
+# --prefix scans only the selected subtree and keeps its relative path: the
+# nested file lands, the sibling at the root does not.
+expect_ok "up --prefix publishes the selected subtree" "$NXR" up "$WORK/orig" "$URL/2.0.0/" --prefix nested/
+if "$NXR" head "$URL/2.0.0/nested/sub.bin" 2> /dev/null | grep -q 'head: 200' &&
+    "$NXR" head "$URL/2.0.0/hello.txt" 2> /dev/null | grep -q 'head: 404'; then
+    ok "the prefix kept its path and left the rest out"
+else
+    no "the prefix kept its path and left the rest out"
+fi
 
 # 24-28. A directory listing asks the search API with `q=<directory>/` and keeps the prefix
 # filter client-side (the rule the protocol page names). The seeded fixture is the manual
@@ -236,6 +344,93 @@ if "$NXR" ls "$URL/bench/flat/" 2> /dev/null | grep -q 'decoy-'; then
     no "the listing never surfaces the loose match's copy"
 else
     ok "the listing never surfaces the loose match's copy"
+fi
+
+# --- deletion and the service plane ----------------------------------------
+
+# The management API of the real server: a live status and the repository list.
+if "$NXR" service status "$BASE/" 2> /dev/null | grep -qi alive; then
+    ok "service status reports a live server"
+else
+    no "service status reports a live server"
+fi
+if "$NXR" service repos "$BASE/" 2> /dev/null | grep -q 'stand'; then
+    ok "service repos lists the stand repository"
+else
+    no "service repos lists the stand repository"
+fi
+if "$NXR" service repo "$URL/" 2> /dev/null | grep -q '^stand raw hosted'; then
+    ok "service repo resolves the repository behind the URL"
+else
+    no "service repo resolves the repository behind the URL"
+fi
+if "$NXR" service assets "$URL/" 2> /dev/null | grep -q 'hello.txt'; then
+    ok "service assets lists the repository through the search API"
+else
+    no "service assets lists the repository through the search API"
+fi
+if "$NXR" service eula "$BASE/" 2> /dev/null | grep -q '^accepted:'; then
+    ok "service eula reads the EULA gate"
+else
+    no "service eula reads the EULA gate"
+fi
+if "$NXR" service repo --detail "$URL/" 2> /dev/null | grep -q '"name": *"stand"'; then
+    ok "service repo --detail reads the admin settings"
+else
+    no "service repo --detail reads the admin settings"
+fi
+
+# rm deletes exactly the named objects on a real server, marker first, and a
+# rerun sees only 404s and still exits 0.
+expect_ok "rm removes the named object" "$NXR" rm "$URL/2.0.0/" --name nested/sub.bin --yes
+if "$NXR" head "$URL/2.0.0/nested/sub.bin" 2> /dev/null | grep -q 'head: 404' &&
+    "$NXR" head "$URL/2.0.0/nested/sub.bin.sha256" 2> /dev/null | grep -q 'head: 404'; then
+    ok "the bytes and the marker are gone"
+else
+    no "the bytes and the marker are gone"
+fi
+expect_ok "an rm rerun is idempotent" "$NXR" rm "$URL/2.0.0/" --name nested/sub.bin --yes
+
+# point clears a pointer file: the channel reads unset afterwards.
+expect_ok "a throwaway channel takes a token" "$NXR" channel set "$URL/throwaway" 1.0.0
+expect_ok "point clears the pointer" "$NXR" point "$URL/throwaway"
+if [ "$("$NXR" channel get "$URL/throwaway" 2> /dev/null)" = "unset" ]; then
+    ok "the cleared pointer reads unset"
+else
+    no "the cleared pointer reads unset"
+fi
+
+# --- cross-repository transfers -------------------------------------------
+
+# A second real repository: mirror pours the names into it, mv moves one name
+# and deletes it at the source, markers travel with the bytes.
+URL2="$BASE/repository/stand2"
+mkdir -p "$WORK/mirror-src"
+printf 'mirror me\n' > "$WORK/mirror-src/one.txt"
+printf 'mirror me too\n' > "$WORK/mirror-src/two.txt"
+expect_ok "the mirror source uploads" "$NXR" up "$WORK/mirror-src" "$URL/mirror-src/"
+expect_ok "mirror pours the names into the second repository" "$NXR" mirror "$URL/mirror-src/" "$URL2/mirror-dst/" --name one.txt --name two.txt
+if "$NXR" head "$URL2/mirror-dst/one.txt" 2> /dev/null | grep -q 'head: 200' &&
+    "$NXR" head "$URL2/mirror-dst/two.txt" 2> /dev/null | grep -q 'head: 200' &&
+    "$NXR" get "$URL/mirror-src/one.txt.sha256" -o "$WORK/m-src.sha256" 2> /dev/null &&
+    "$NXR" get "$URL2/mirror-dst/one.txt.sha256" -o "$WORK/m-dst.sha256" 2> /dev/null &&
+    cmp -s "$WORK/m-src.sha256" "$WORK/m-dst.sha256"; then
+    ok "the mirrored bytes and marker match the source"
+else
+    no "the mirrored bytes and marker match the source"
+fi
+expect_ok "mv moves one name to the second repository" "$NXR" mv "$URL/mirror-src/" "$URL2/mirror-dst/" --name one.txt --yes
+if "$NXR" head "$URL/mirror-src/one.txt" 2> /dev/null | grep -q 'head: 404' &&
+    "$NXR" head "$URL/mirror-src/one.txt.sha256" 2> /dev/null | grep -q 'head: 404' &&
+    "$NXR" head "$URL2/mirror-dst/one.txt" 2> /dev/null | grep -q 'head: 200'; then
+    ok "the move kept the destination copy and deleted the source pair"
+else
+    no "the move kept the destination copy and deleted the source pair"
+fi
+if "$NXR" head "$URL/mirror-src/two.txt" 2> /dev/null | grep -q 'head: 200'; then
+    ok "the move left the unnamed sibling alone"
+else
+    no "the move left the unnamed sibling alone"
 fi
 
 # --- summary ----------------------------------------------------------------

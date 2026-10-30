@@ -1,6 +1,6 @@
 # @nexus-raw/nxr
 
-Node bindings for [nexus-raw](https://github.com/Lipen/nexus-raw): the `nxr` command surface as promises over Sonatype Nexus raw storage.
+Node bindings for [nexus-raw](https://github.com/Lipen/nexus-raw): the `nxr` transfer, layout and service-metadata surface as promises over Sonatype Nexus raw storage.
 
 Each command is one function, the URL is an argument, and there is no config file: credentials come from the call or from the environment.
 Transfers follow the same rules as the CLI: an artifact carries a `<name>.sha256` marker, every run starts with a symmetric diff, and a complete artifact with a different digest is rejected instead of overwritten.
@@ -31,12 +31,15 @@ console.log(`uploaded ${published.uploaded}`)
 const fetched = await down(repo, 'vendor/prebuilt', { names: ['app-1.4.0.zip', 'manifest.json'] })
 console.log(`downloaded ${fetched.downloaded}`)
 
-// Compare before writing anything.
-const report = await diff('dist/1.4.0', repo)
+// Compare before writing anything. `diff` needs an enumeration source like
+// `down` does: the names, or `{ ls: true }` when the server has the search API.
+const report = await diff('dist/1.4.0', repo, { names: ['app-1.4.0.zip', 'manifest.json'] })
 for (const entry of report.entries) console.log(entry.state, entry.path)
 ```
 
 Every call is self-sufficient, and a rerun of an interrupted transfer resumes instead of starting over.
+
+The operator diagnostics stay on the CLI: `audit`, `mv`, `doctor`, and the `service status`, `service repo` and `service eula` probes have no binding here.
 
 ## Errors and events
 

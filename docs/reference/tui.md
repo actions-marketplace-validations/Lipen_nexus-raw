@@ -71,9 +71,12 @@ The overlay works against a refusing server the same way the CLI does: the error
 ## The file card
 
 `enter` on a file opens a card, never a download.
-The card shows the name, the path from the repository root, the full URL, the size from a HEAD request and the sha256 from the `.sha256` marker when the server has one.
+The card shows the name, the path from the repository root, the full URL, the size and the sha256.
+The listing already carries both when the search index holds them, so they show at once and cost no request.
+A fact the listing lacks is probed in the background: a HEAD for the size, a `.sha256` GET for the digest.
 Inside the card: `s` downloads the file into the destination folder, `o` picks another destination and returns to the card, `c` copies the URL, `esc`/`enter`/`q` close.
 The download is a direct `get` with the digest verified against the marker: no enumeration is involved.
+The file then gets the marker the browser computed, named relative to the destination exactly as `down` names it, so the downloaded tree passes `nxr verify` offline.
 
 ## The destination folder
 
@@ -82,6 +85,10 @@ The session starts with `download.dir` from the config.
 `o` opens a picker prefilled with the current destination: edit and press enter, or esc to cancel.
 A file lands as `{destination}/{name}`, a subtree as `{destination}/{name}/...`, a whole repository as `{destination}/{repo}/...`.
 Nothing is written outside the destination, and nothing is written before a dialog is confirmed.
+
+That boundary is enforced at the data, not at the key: a repository row survives only when its URL shares the session's scheme, host and port and its name is one ordinary directory segment, and a listing segment that is not one safe path component (a decoded `/`, a `..`, a control byte, a trailing dot or space) is refused with `refused:` before a transfer starts.
+Spaces and unicode are ordinary filesystem names, so a folder the server calls `Release Notes` downloads like any other.
+A server that names a repository `/home/user/.ssh`, puts a percent-encoded `/` into a file name or points a repository at another host therefore changes the list and the status line, never the filesystem.
 
 ## Put
 
@@ -205,7 +212,7 @@ Values never appear in logs or on screen.
 
 ## Downloads
 
-A file entry downloads through the direct `get` primitive into `{destination}/{rel}`, with the `.sha256` marker verified when the server has one.
+A file entry downloads through the direct `get` primitive into `{destination}/{rel}`, with the `.sha256` marker verified when the server has one and written beside the file afterwards, so the tree verifies offline.
 A folder entry (`d` on a folder, `D` on the current directory) and a whole repository (`d` on the repositories screen) walk the subtree with `ls_entries()` recursively and download the set in one transfer.
 The `D` dialog shows the target path live before anything starts, and nothing is written until it is confirmed.
 

@@ -53,6 +53,7 @@ stateDiagram-v2
 `Complete` means bytes plus a sibling whose digest matches.
 `Markerless` means bytes only: normal mid-transfer, suspicious when a run finished.
 `Broken` means bytes and marker disagree, and `nxr` will not fix it by overwriting: the next `up` or `down` refuses with `mismatch` until a human deletes or repairs one side.
+When the pair is local, the repair is local too: delete the stale `.sha256` and the next scan regenerates it from the bytes.
 `Absent` means no bytes, and a marker without bytes reads as `Absent`.
 
 ## Divergent objects are never overwritten
@@ -63,9 +64,11 @@ A local file drifted after its marker was written:
 
 ```console
 $ nxr up dist/1.4.0/ https://nexus.example.com/repository/raw-main/1.4.0/
-error: mismatch: pinned.xml: local object is broken and must not be overwritten: digest mismatch: sibling 8eed95dc200589a2b132c182fac5ce9335866b9d2aa0225760ef944bac4b09c5, actual 4925cd5b6a8a02b33a3bd303661d19a84a640c533b32b78229659be743c1d2f6
+error: mismatch: pinned.xml: local object is broken and must not be overwritten: digest mismatch: sibling 8eed95dc200589a2b132c182fac5ce9335866b9d2aa0225760ef944bac4b09c5, actual 4925cd5b6a8a02b33a3bd303661d19a84a640c533b32b78229659be743c1d2f6. Delete the stale sibling to regenerate it, or restore the bytes, then rerun
 hint: the two sides diverge: delete or fix one copy, never let nxr overwrite a diverging object
 ```
+
+The error names the repair: `rm pinned.xml.sha256`, then rerun, and the scan writes a fresh marker from the bytes it finds.
 
 The same name holds two different artifacts on the two sides, for example a rebuild published into a version directory that was already used:
 
@@ -275,15 +278,19 @@ Verified against Nexus Community Edition 3.79.1-04: the same shapes ride the moc
 Without `--deep` doctor checks the invocation (credentials, TLS, settings, one reachability probe).
 With `--deep` it adds read-only probes of the server itself, each independent: one probe refusing never stops the others.
 
+The base checks (credentials, tls, settings, proxy, probe) run with or without `--deep`.
+`--deep` adds one `deep:` line per probe:
+
 | Probe | What it checks | Verdicts |
 |:------|:---------------|:---------|
-| auth | a GET of the repository root (or the probe target) with your credentials | `ok`, or 401/403 named as a credential verdict |
-| range | HEAD for the size, then GET `Range: bytes=0-0` | `206` ok, `200` is `range-stripped` (warn: `--segments` degrades), a refusal is named |
-| content-length | the HEAD answer | present, or absent (warn: resume and `--segments` are limited) |
-| search | one page of the search API for the repository | `ok`, or `search-dead` on 400/404 (warn: `diff --via search` refuses there, `--fallback` saves it) |
-| repo-type | the service REST API, read-only | `hosted`, `group` or `proxy`, with the group members in order for a group |
-| tls | the existing checks, plus how `--tls-insecure` is reflected | as always |
-| version | `GET /service/rest/v1/status` when alive | the version string, diagnostic only, no gate |
+| `deep:version` | `GET /service/rest/v1/status` | the version string when the document carries one, `status endpoint answered` when the body is empty (3.96 answers an empty body), `absent (404)` without the service plane |
+| `deep:content-length` | the HEAD answer | present, or absent (warn: resume and `--segments` are limited) |
+| `deep:range` | HEAD for the size, then GET `Range: bytes=0-0` | `206` ok, `200` is `range-stripped` (warn: `--segments` degrades), a refusal is named |
+| `deep:search` | one page of the search API for the repository | `ok`, or `search-dead` on 400/404 (warn: `diff --via search` refuses there, `--fallback` saves it) |
+| `deep:repo-type` | the repositories document, read-only | `hosted, format raw`, `group` with the members in order, `proxy`, and a 404 is `skipped: the service plane is absent` |
+| `deep:eula` | `GET /service/rest/v1/system/eula` | `accepted`, the `not accepted` warn with the `nxr service eula --accept` next line, or `skipped: no EULA gate` on a 404 |
+
+A warning check carries the `[ warn ]` marker and the `"warn":true` field under `--json`, and the summary counts it: `all checks passed with 2 warning(s)`.
 
 Every probe with a target (range, content-length) needs an object to probe.
 An empty repository is a normal case, not an error: doctor before the first `up` is exactly when you want it.

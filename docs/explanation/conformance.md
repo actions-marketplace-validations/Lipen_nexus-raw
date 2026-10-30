@@ -85,6 +85,7 @@ The mock also follows the protocol in its own answers: a status answer that can 
 Group repositories are a separate deployment kind, not a scenario: `MockNexus::start_group` builds one over two or more running members.
 The group forwards reads to the members in order and relays the first `2xx`, so every scenario in the table above keeps applying behind a group.
 Writes are refused by the group itself with `405` and `Allow: GET,HEAD`, in the wire shape of the real Nexus group handler.
+The client reads that `405` as the read-only refusal (exit `1`, the hint names the group), on PUT and DELETE alike: `up_against_a_group_refuses_with_405` and `rm_against_a_group_refuses_as_read_only`.
 The dispatch is faithful to the real `GroupHandler.java` (method switch at lines 103-112, the first-2xx member walk at 124-166).
 Group search is not modeled: the search API reads the metadata database rather than the group dispatch.
 
@@ -114,6 +115,7 @@ The client-facing contract page rendered from the same table: [wire invariants](
 | `redirect` | GET and HEAD answer `301` with `Location` and an empty body. Writes stay atomic | redirects are never followed: a 301 surfaces as the plain HTTP error (exit 3) | core: `redirect_refuses_reads_with_http_301` · CLI: `redirect_exit_3` · mock: `redirect_answers_301_on_reads_only` |
 | `readonly` | every DELETE answers `403`, the store keeps everything | the read-only repository refuses `rm` and `point` with exit 1, and a refused run has deleted nothing | core: `readonly_refuses_rm_and_changes_nothing`, `point_clear_on_readonly_refuses` · CLI: `rm_readonly_refuses_and_keeps_bytes` · mock: `readonly_refuses_every_delete` |
 | `no-service` | the service REST endpoint answers `404` like a store miss. Storage is `atomic` | `service repos` refuses with exit 3 and the server-root hint. Every storage invariant is unaffected | core: `service_repos_missing_refuses_with_the_root_hint` · CLI: `service_repos_missing_prints_the_root_hint` · mock: the seeded document is simply absent |
+| `static-host` | a bare file server: `GET`/`HEAD` serve the stored bytes with `Range`, every write answers `405` with `Allow: GET,HEAD`, and every `/service/rest/` path answers `404` | the read profile works off Nexus: reads, ranges and resumes land, a write is the read-only refusal (exit 1), and the search enumeration refuses with `cannot enumerate` | core: `static_host_serves_reads_and_refuses_writes` · CLI: `static_host_reads_and_refuses_writes` · python: `test_static_host_reads_and_refuses_writes` · mock: `static_host_serves_reads_and_refuses_writes` |
 | `search-400` | the search API answers `400` when the `repository` parameter names an unknown repository. Served repositories and other requests behave like `atomic` | a repository-scoped search 400 is diagnosed: `ls` refuses with exit 3 and the missing-or-non-raw-repository hint, and a search 404 keeps the generic enumeration hint | core: `ls_unknown_repository_hinted_on_400_not_on_404` · CLI: `ls_unknown_repository_prints_the_repository_hint` · mock: `search_unknown_repo_answers_400_known_repos_pass_through` |
 
 ## Client coverage

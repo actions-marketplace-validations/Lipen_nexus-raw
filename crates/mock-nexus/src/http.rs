@@ -208,6 +208,22 @@ fn handle(shared: &Shared, stream: &mut TcpStream, req: &Request, path: &str) {
         }
     }
 
+    // static-host: a bare file server, not a Nexus. Every write is refused with
+    // 405 and `Allow: GET,HEAD` before the store is touched, and the whole
+    // service plane is absent, the search API included.
+    if shared.spec.static_host {
+        if matches!(req.method.as_str(), "PUT" | "DELETE") {
+            crate::group::refuse_writes(shared, stream, req, path);
+            return;
+        }
+        if path.starts_with("service/rest/") {
+            log_request(shared, &req.method, path, Outcome::Status(404));
+            let resp = bodyless_for_head(&req.method, plain(404, b"not found\n", None));
+            let _ = server::write_response(stream, &resp);
+            return;
+        }
+    }
+
     // search-400: a repository-scoped search for an unknown repository is refused with 400, like a real Nexus.
     // The served names are the ones the seeded service document lists.
     // A search without a repository parameter is left alone.
@@ -332,10 +348,10 @@ fn handle(shared: &Shared, stream: &mut TcpStream, req: &Request, path: &str) {
                         // repo-relative paths, the shape the search API reports.
                         // `q` narrows the list with the same loose match the generated pages model.
                         let q = query_param(&req.target, "q").map(percent_decode);
-                        let keys: Vec<String> = lock(&shared.store)
-                            .keys()
-                            .cloned()
-                            .filter_map(|k| {
+                        let store = lock(&shared.store);
+                        let keys: Vec<(String, usize, Option<String>)> = store
+                            .iter()
+                            .filter_map(|(k, bytes)| {
                                 // The repository collection is a service document
                                 // the store happens to carry, not an asset the
                                 // search sees.
@@ -344,22 +360,37 @@ fn handle(shared: &Shared, stream: &mut TcpStream, req: &Request, path: &str) {
                                 }
                                 // Strip the `repository/<repo>/` prefix the store keys
                                 // carry when it is there. A root-style store key passes as is.
-                                if let Some(rest) = k.strip_prefix("repository/") {
-                                    return Some(
-                                        rest.split_once('/')
-                                            .map_or(rest, |(_, rel)| rel)
-                                            .to_owned(),
-                                    );
-                                }
-                                Some(k)
+                                // The size comes from the stored bytes, so the page
+                                // reports a fact the way the real answer does.
+                                let path = if let Some(rest) = k.strip_prefix("repository/") {
+                                    rest.split_once('/').map_or(rest, |(_, rel)| rel).to_owned()
+                                } else {
+                                    k.clone()
+                                };
+                                // The store keeps a marker beside the bytes when the
+                                // writer left one; its body is the artifact digest, the
+                                // fact a real search answer carries. A marker row's own
+                                // digest is not stored, so its item omits the field
+                                // rather than inventing one.
+                                let digest = if k.ends_with(".sha256") {
+                                    None
+                                } else {
+                                    store
+                                        .get(&format!("{k}.sha256"))
+                                        .and_then(|marker| marker_digest(marker))
+                                };
+                                Some((path, bytes.len(), digest))
                             })
-                            .filter(|k| q.as_deref().is_none_or(|q| q_matches(q, k)))
+                            .filter(|(path, _, _)| q.as_deref().is_none_or(|q| q_matches(q, path)))
                             .collect();
                         let items: Vec<String> = keys
                             .iter()
-                            .map(|k| {
+                            .map(|(k, size, digest)| {
+                                let checksum = digest.as_ref().map_or_else(String::new, |d| {
+                                    format!(r#","checksum":{{"sha256":"{d}"}}"#)
+                                });
                                 format!(
-                                    "{{\"downloadUrl\":\"/{k}\",\"path\":\"/{k}\",\"id\":\"raw-main:{k}\",\"repository\":\"raw-main\",\"format\":\"raw\",\"checksum\":{{\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}}}}"
+                                    r#"{{"downloadUrl":"/{k}","path":"/{k}","id":"raw-main:{k}","repository":"raw-main","format":"raw","fileSize":{size}{checksum}}}"#
                                 )
                             })
                             .collect();
@@ -593,4 +624,12 @@ fn auth_decision(header: Option<&str>, expected_b64: &str) -> bool {
         return false;
     };
     scheme.eq_ignore_ascii_case("basic") && token.trim() == expected_b64
+}
+
+/// The digest line of a stored marker: `<64 hex>  <name>\n`.
+/// The first token is the artifact digest; anything else is not a marker and yields `None`.
+fn marker_digest(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let first = text.split_whitespace().next()?;
+    (first.len() == 64 && first.bytes().all(|b| b.is_ascii_hexdigit())).then(|| first.to_owned())
 }

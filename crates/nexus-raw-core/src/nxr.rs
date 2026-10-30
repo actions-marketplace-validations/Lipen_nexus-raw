@@ -58,6 +58,15 @@ pub enum Enumeration {
 }
 
 impl Enumeration {
+    /// The prefixes this source carries: empty unless [`Enumeration::with_prefixes`] built it.
+    #[must_use]
+    pub fn prefixes(&self) -> &[crate::model::name::NamePrefix] {
+        match self {
+            Self::Filtered { prefixes, .. } => prefixes,
+            Self::Names(_) | Self::Search => &[],
+        }
+    }
+
     /// Keep only the names under one of `prefixes` (the `--prefix` filter).
     /// Applied after resolution and dedup: the inner source stays the single place enumeration happens.
     ///
@@ -89,6 +98,19 @@ pub struct Nxr {
     /// The AIMD budget of the most recent directory transfer, kept for
     /// introspection: conformance tests assert the limit was reduced after 429s.
     last_aimd: Arc<std::sync::Mutex<Option<Arc<crate::transport::aimd::WorkerLimit>>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Keep only the entries under one of `prefixes`: the `--prefix` rule the whole
+/// delta obeys, the local-only entries included.
+fn filter_prefixes(entries: Vec<Delta>, prefixes: &[crate::model::name::NamePrefix]) -> Vec<Delta> {
+    if prefixes.is_empty() {
+        return entries;
+    }
+    entries
+        .into_iter()
+        .filter(|entry| prefixes.iter().any(|prefix| prefix.matches(entry.name())))
+        .collect()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -526,14 +548,19 @@ impl Nxr {
     /// Returns [`Error::Io`] and [`Error::UnsafeName`] from the local scan, [`Error::Enumerate`] when the enumeration is empty, and transport, auth or HTTP errors while probing the remote states.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn delta(&self, dir: &Path, enum_src: Enumeration) -> Result<Vec<Delta>, Error> {
+        // The prefix filter narrows the whole report, not just the remote side:
+        // the local scan sees every name, and a local-only entry outside the
+        // prefixes would otherwise report as `missing-remote`.
+        let prefixes = enum_src.prefixes().to_vec();
         let remote_names = self.resolve_names(enum_src).await?;
         let local_names = sync::scan_dir(dir)?;
         let locals = sync::local_statuses(dir, local_names).await;
         let remotes = self.remote_states_for(&remote_names).await?;
         let d = dir.to_owned();
-        tokio::task::spawn_blocking(move || delta::compare(&d, locals, remotes))
+        let entries = tokio::task::spawn_blocking(move || delta::compare(&d, locals, remotes))
             .await
-            .map_err(|e| Error::misuse(format!("task panicked: {e}")))
+            .map_err(|e| Error::misuse(format!("task panicked: {e}")))?;
+        Ok(filter_prefixes(entries, &prefixes))
     }
 
     /// The delta report built from the search API's per-asset facts (`diff --via search`).
@@ -557,14 +584,23 @@ impl Nxr {
     ) -> Result<Vec<Delta>, Error> {
         let local_names = sync::scan_dir(dir)?;
         let locals = sync::local_statuses(dir, local_names).await;
-        let mut remotes = layout::ls::search_assets_facts(&self.client, &self.base).await?;
+        let (mut remotes, skipped) =
+            layout::ls::search_assets_facts(&self.client, &self.base).await?;
+        if skipped > 0 {
+            self.events.warning(format!(
+                "the search listing holds {skipped} name(s) outside the artifact grammar: \
+                 they are left out, and the protocol cannot transfer them"
+            ));
+        }
         if !prefixes.is_empty() {
             remotes.retain(|(n, _)| prefixes.iter().any(|p| p.matches(n)));
         }
         let d = dir.to_owned();
-        tokio::task::spawn_blocking(move || delta::compare_search(&d, locals, remotes))
-            .await
-            .map_err(|e| Error::misuse(format!("task panicked: {e}")))
+        let entries =
+            tokio::task::spawn_blocking(move || delta::compare_search(&d, locals, remotes))
+                .await
+                .map_err(|e| Error::misuse(format!("task panicked: {e}")))?;
+        Ok(filter_prefixes(entries, prefixes))
     }
 
     /// Audit the repository at the facade base (§11).
@@ -833,7 +869,7 @@ impl Nxr {
     /// The plan is [`sync::classify_if_changed`](crate::sync): the only skip is a complete
     /// local copy whose digest equals the remote marker's digest, everything divergent
     /// re-PUTs, and a broken local or remote object refuses the run exactly like the plain `up`:
-    /// the flag relaxes the divergence rule, never the never-overwrite rule.
+    /// the flag relaxes exactly the complete-pair divergence refusal (protocol §5.2), and nothing else.
     ///
     /// # Errors
     ///
@@ -1038,6 +1074,12 @@ impl Nxr {
         state_mode: crate::sync::StateMode<'_>,
         verify: bool,
     ) -> Result<Summary, Error> {
+        // A fresh destination is created, like `down` does: the part files land
+        // under it, and a missing directory would fail as a raw I/O error named
+        // after a staging file.
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| Error::io(dir, e))?;
         let (actions, state, state_path) = self
             .clone_prepare(dir, prefixes, state_mode, verify)
             .await?;
@@ -1073,13 +1115,19 @@ impl Nxr {
         ),
         Error,
     > {
-        let names: Vec<ArtifactName> =
-            crate::layout::ls::search_repo_assets(&self.client, &self.base)
-                .await?
-                .into_iter()
-                .map(|(name, _, _)| name)
-                .filter(|name| prefixes.is_empty() || prefixes.iter().any(|p| p.matches(name)))
-                .collect();
+        let (assets, skipped) =
+            crate::layout::ls::search_repo_assets_counted(&self.client, &self.base).await?;
+        if skipped > 0 {
+            self.events.warning(format!(
+                "the search listing holds {skipped} name(s) outside the artifact grammar: \
+                 they are left out, and the protocol cannot transfer them"
+            ));
+        }
+        let names: Vec<ArtifactName> = assets
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .filter(|name| prefixes.is_empty() || prefixes.iter().any(|p| p.matches(name)))
+            .collect();
         if names.is_empty() {
             return Err(Error::Enumerate {
                 url: self.base.clone(),
@@ -1152,7 +1200,17 @@ impl Nxr {
                 v.retain(|n| seen.insert(n.clone()));
                 v
             }
-            Enumeration::Search => layout::ls::search_assets(&self.client, &self.base).await?,
+            Enumeration::Search => {
+                let (names, skipped) =
+                    layout::ls::search_assets_counted(&self.client, &self.base).await?;
+                if skipped > 0 {
+                    self.events.warning(format!(
+                        "the search listing holds {skipped} name(s) outside the artifact grammar: \
+                         they are left out, and the protocol cannot transfer them"
+                    ));
+                }
+                names
+            }
             Enumeration::Filtered { inner, prefixes } => {
                 let all = Box::pin(self.resolve_names(*inner)).await?;
                 let total = all.len();
@@ -1289,8 +1347,7 @@ impl Nxr {
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn mirror(&self, dst: &Nxr, enum_src: Enumeration) -> Result<Summary, Error> {
         let actions = self.mirror_plan(dst, enum_src).await?;
-        // No implicit claim: no name is special, the enumeration order stands.
-        let claim = None::<ArtifactName>;
+        // No claim: no name is special, the enumeration order stands.
         let staging = mirror::staging_dir(&self.base, &dst.base);
         secure_staging(&staging)?;
         // Two concurrent mirrors of one pair would interleave the same part files:
@@ -1311,7 +1368,6 @@ impl Nxr {
                 self.base.clone(),
                 dst.base.clone(),
                 actions,
-                claim,
                 aimd,
             )
             .await
@@ -1428,7 +1484,18 @@ impl Nxr {
     ///
     /// Returns [`Error::Misuse`] when the base is not a directory URL and [`Error::Enumerate`] when the search endpoint is unavailable or unparseable.
     pub async fn ls_assets(&self) -> Result<Vec<ArtifactName>, Error> {
-        layout::ls::search_assets(&self.client, &self.base).await
+        Ok(self.ls_assets_counted().await?.0)
+    }
+
+    /// The flat asset names under the base, with the count of names the walk
+    /// skipped because they are outside the artifact grammar: a server can hold
+    /// such a name, and the caller names the count instead of losing it silently.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Nxr::ls_assets`].
+    pub async fn ls_assets_counted(&self) -> Result<(Vec<ArtifactName>, usize), Error> {
+        layout::ls::search_assets_counted(&self.client, &self.base).await
     }
 
     /// Poll the search index until every given name is visible, or the budget runs out.

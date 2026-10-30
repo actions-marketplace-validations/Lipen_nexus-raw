@@ -21,6 +21,7 @@ struct Flags {
     cut_after: usize,
     fake_length: bool,
     flaky: u32,
+    lag_ms: u64,
     rate_429s: usize,
     retry_after_secs: u64,
     location: String,
@@ -40,6 +41,7 @@ impl Default for Flags {
             cut_after: 64,
             fake_length: false,
             flaky: 2,
+            lag_ms: 6000,
             rate_429s: 2,
             retry_after_secs: 1,
             location: "/relocated".to_owned(),
@@ -107,6 +109,9 @@ fn main() {
         }
         if value["read_only"].as_bool() == Some(true) {
             spec = spec.with_read_only();
+        }
+        if value["static_host"].as_bool() == Some(true) {
+            spec = spec.with_static_host();
         }
         if value["markerless"].as_bool() == Some(true) {
             spec = spec.with_markerless();
@@ -233,6 +238,7 @@ fn build_scenario(name: &str, flags: &Flags) -> Option<Scenario> {
             location_path: flags.location.clone(),
         }),
         "readonly" => Some(Scenario::ReadOnly),
+        "static-host" => Some(Scenario::StaticHost),
         "no-service" => Some(Scenario::NoService),
         "search-400" => Some(Scenario::Search400),
         "service-status-empty" => Some(Scenario::ServiceStatusEmpty),
@@ -253,7 +259,9 @@ fn build_scenario(name: &str, flags: &Flags) -> Option<Scenario> {
         "assets-prefix-q" => Some(Scenario::AssetsPrefixQ),
         "eula-gate" => Some(Scenario::EulaGate),
         "eula-absent" => Some(Scenario::EulaAbsent),
-        "search-lag" => Some(Scenario::SearchLag { lag_ms: 6000 }),
+        "search-lag" => Some(Scenario::SearchLag {
+            lag_ms: flags.lag_ms,
+        }),
         "detail-in-hint" => Some(Scenario::DetailInHint),
         "ignore-range" => Some(Scenario::IgnoreRange),
         "audit-litter" => Some(Scenario::AuditLitter),
@@ -283,6 +291,7 @@ fn parse_flags(args: &[String], flags: &mut Flags) -> Result<(), String> {
             "--partial-bytes" => flags.partial_bytes = parse_num(flag, value)?,
             "--cut-after" => flags.cut_after = parse_num(flag, value)?,
             "--flaky" => flags.flaky = parse_num(flag, value)?,
+            "--lag-ms" => flags.lag_ms = parse_num(flag, value)?,
             "--rate-429s" => flags.rate_429s = parse_num(flag, value)?,
             "--retry-after-secs" => flags.retry_after_secs = parse_num(flag, value)?,
             "--location" => flags.location = value.to_owned(),
@@ -322,7 +331,7 @@ fn fail_usage() -> ! {
     eprintln!(
         "usage: mock-nexus <scenario> [--port N] [--seed-dir DIR] [--config FILE] \
          [--chunk-delay-ms N] [--chunk-size N] [--partial-bytes N] [--cut-after N] \
-         [--fake-length] [--flaky K] [--rate-429s N] [--retry-after-secs N] \
+         [--fake-length] [--flaky K] [--lag-ms N] [--rate-429s N] [--retry-after-secs N] \
          [--location PATH] [--auth user:pass]"
     );
     eprintln!("       mock-nexus --print-scenarios");
@@ -365,6 +374,8 @@ mod tests {
                 "96",
                 "--flaky",
                 "5",
+                "--lag-ms",
+                "0",
                 "--rate-429s",
                 "7",
                 "--retry-after-secs",
@@ -384,6 +395,7 @@ mod tests {
         assert_eq!(flags.cut_after, 96);
         assert!(!flags.fake_length);
         assert_eq!(flags.flaky, 5);
+        assert_eq!(flags.lag_ms, 0);
         assert_eq!(flags.rate_429s, 7);
         assert_eq!(flags.retry_after_secs, 3);
         assert_eq!(flags.location, "/moved");

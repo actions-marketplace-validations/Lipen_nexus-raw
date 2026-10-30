@@ -222,6 +222,142 @@ fn readonly_refuses_every_delete() {
     assert_eq!(body, b"PAYLOAD");
 }
 
+/// search-lag: the store-backed page reports the size of the stored bytes, the
+/// field the real answer carries.
+#[test]
+fn search_lag_page_reports_the_stored_size() {
+    let server = MockNexus::start(Scenario::SearchLag { lag_ms: 0 }).unwrap();
+    // One PUT arms the catch-up deadline and stores the object.
+    let (status, _, _) = exchange(
+        server.addr(),
+        "PUT",
+        "/repository/raw-main/1.0.0/a.bin",
+        b"PAYLOAD",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(status, 201);
+
+    let (status, _, body) = exchange(
+        server.addr(),
+        "GET",
+        "/service/rest/v1/search/assets?repository=raw-main",
+        b"",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains(r#""fileSize":7"#),
+        "the page reports the stored size: {text}"
+    );
+}
+
+/// search-lag: the store-backed page carries the artifact digest from the stored
+/// marker, and a marker row reports no digest rather than a placeholder.
+#[test]
+fn search_lag_page_reports_the_marker_digest() {
+    let server = MockNexus::start(Scenario::SearchLag { lag_ms: 0 }).unwrap();
+    let digest = "ab".repeat(32);
+    let (status, _, _) = exchange(
+        server.addr(),
+        "PUT",
+        "/repository/raw-main/1.0.0/a.bin",
+        b"PAYLOAD",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(status, 201);
+    let marker = format!("{digest}  a.bin\n");
+    let (status, _, _) = exchange(
+        server.addr(),
+        "PUT",
+        "/repository/raw-main/1.0.0/a.bin.sha256",
+        marker.as_bytes(),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(status, 201);
+
+    let (status, _, body) = exchange(
+        server.addr(),
+        "GET",
+        "/service/rest/v1/search/assets?repository=raw-main",
+        b"",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains(&format!(
+            r#""fileSize":7,"checksum":{{"sha256":"{digest}"}}"#
+        )),
+        "the page echoes the stored digest: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            r#""path":"/1.0.0/a.bin.sha256","id":"raw-main:1.0.0/a.bin.sha256","repository":"raw-main","format":"raw","fileSize":{}"#,
+            marker.len()
+        )),
+        "the marker row is listed without invented facts: {text}"
+    );
+    assert!(
+        !text.contains("0000000000000000000000000000000000000000000000000000000000000000"),
+        "no placeholder digest: {text}"
+    );
+}
+
+/// static-host: reads and ranges, every write refused with 405 and `Allow`, no service plane.
+#[test]
+fn static_host_serves_reads_and_refuses_writes() {
+    let server = MockNexus::start(Scenario::StaticHost).unwrap();
+    server.insert("a.bin", b"PAYLOAD");
+
+    let (status, headers, body) = exchange(server.addr(), "GET", "/a.bin", b"", &[]).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(body, b"PAYLOAD");
+    assert_eq!(header_value(&headers, "content-length"), Some("7"));
+
+    let (status, _, body) = exchange(
+        server.addr(),
+        "GET",
+        "/a.bin",
+        b"",
+        &[("Range", "bytes=1-3")],
+    )
+    .unwrap();
+    assert_eq!(status, 206);
+    assert_eq!(body, b"AYL");
+
+    for method in ["PUT", "DELETE"] {
+        let (status, headers, body) =
+            exchange(server.addr(), method, "/a.bin", b"NEW", &[]).unwrap();
+        assert_eq!(status, 405, "{method}");
+        assert_eq!(
+            header_value(&headers, "allow"),
+            Some("GET,HEAD"),
+            "{method}: the group wire shape"
+        );
+        assert!(body.is_empty(), "{method}");
+    }
+    assert_eq!(
+        server.store_get("a.bin").as_deref(),
+        Some(b"PAYLOAD".as_slice()),
+        "a refused write changes nothing"
+    );
+
+    for path in [
+        "/service/rest/v1/repositories",
+        "/service/rest/v1/search/assets?repository=raw-main",
+        "/service/rest/v1/status",
+    ] {
+        let (status, _, _) = exchange(server.addr(), "GET", path, b"", &[]).unwrap();
+        assert_eq!(status, 404, "{path}: a static host has no service plane");
+    }
+}
+
 /// search-400: a repository-scoped search for an unknown repository is refused with 400, a served repository keeps the store answer.
 #[test]
 fn search_unknown_repo_answers_400_known_repos_pass_through() {

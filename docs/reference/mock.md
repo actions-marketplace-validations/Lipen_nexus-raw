@@ -10,6 +10,10 @@ That narrowness is the point: every byte on the wire is either contract or failu
 The full table with per-scenario wire behavior and the pinned invariant lives in [invariants](invariants.md), generated from the same Rust constant the `--print-scenarios` output prints.
 It covers: transport failures (`partial-put`, `cut-body`, `drop-connection`, `freeze-upload`), framing lies (`sizeless`, `foreign-marker`, `markerless`), pacing (`slow`, `flaky`, `retry-after-503`, `rate-limit` with `Retry-After`), server edges (`redirect`, `readonly`, `no-service`, `search-400`), service-API shapes (status, repositories, EULA, assets pagination), client-ergonomics (`detail-in-hint`, `ignore-range`), and integrity litter for `nxr audit` (`audit-litter`).
 
+Search is served only by the scenarios that model it: `search-lag` (store-backed, one item per stored object, pages of ten), `assets-pagination`, `assets-prefix-q`, `audit-litter` (the litter page) and `search-400` (the failure shape).
+Every other scenario 404s `/service/rest/v1/search/assets`, so `clone`, the TUI and the mount refuse with `cannot enumerate` against them.
+To clone a tree you uploaded yourself, run `mock-nexus search-lag --lag-ms 0`: it reports exactly the store, markers included.
+
 ## Run the binary
 
 ```bash
@@ -19,10 +23,11 @@ cargo run -p mock-nexus -- atomic --port 8080
 
 `--print-scenarios` prints the table as a JSON array, the same list the Python suite checks against.
 
-Preset knobs ride the flags: `--partial-bytes N`, `--cut-after N --fake-length`, `--chunk-delay-ms N --chunk-size N`, `--flaky K`, `--rate-429s N --retry-after-secs N`, `--location PATH`, `--auth user:pass`.
+Preset knobs ride the flags: `--partial-bytes N`, `--cut-after N --fake-length`, `--chunk-delay-ms N --chunk-size N`, `--flaky K`, `--lag-ms N` (the `search-lag` catch-up window, 6000 ms unless named), `--rate-429s N --retry-after-secs N`, `--location PATH`, `--auth user:pass`.
 
 ### `--seed-dir DIR`
 
+The key is the path as served, so a tree meant for a repository URL carries the prefix in the seed directory (`DIR/repository/raw-main/1.0.0/a.bin`), and a tree without it is served at the server root (`http://host/1.0.0/a.bin`), invisible to `/repository/raw-main/…` requests.
 Every file under `DIR` becomes an object at its relative path, recursively, before the first request:
 
 ```bash
@@ -90,6 +95,8 @@ Then the behavior itself: the wire arms live in `http.rs` (pipeline gates) and `
 
 ## search-lag
 
-The search index lags behind writes: the first storage PUT arms a catch-up deadline (6000 ms), and `GET /service/rest/v1/search/assets` answers the empty page until it passes, then a store-backed listing.
+The search index lags behind writes: the first storage PUT arms a catch-up deadline (6000 ms, configurable with `--lag-ms`), and `GET /service/rest/v1/search/assets` answers the empty page until it passes, then a store-backed listing.
+The store-backed items carry the size of the stored bytes and, when the writer left a marker, the marker's digest.
+A marker row itself reports no digest, and the page never invents a placeholder.
 The scenario models a real server's eventual search visibility, and pins the `up --wait-index` contract: the wait ends with every uploaded name reported visible, and an expired budget is a warning line, never a failed exit.
 Storage reads and writes behave like `atomic`.

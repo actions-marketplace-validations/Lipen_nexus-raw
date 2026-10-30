@@ -30,6 +30,7 @@ __all__ = [
     "MisuseError",
     "Nxr",
     "NxrError",
+    "ReadOnlyError",
     "SearchRepoMissing",
     "TransportError",
     "UnsafeName",
@@ -87,6 +88,17 @@ class AuthError(NxrError):
     """
 
     exit_code = 3
+
+
+class ReadOnlyError(NxrError):
+    """The server refused a write with 405: a group repository is read-only.
+
+    The rust core classes a 405 to a PUT as ReadOnly (exit 1, never retried):
+    a retry cannot change the answer, and the hint names the group case instead
+    of the credentials one.
+    """
+
+    exit_code = 1
 
 
 class HttpError(NxrError):
@@ -421,6 +433,19 @@ class Nxr:
                 continue
             if 200 <= status < 300:
                 return status, headers, payload
+            # A 405 to a write is the read-only refusal, the class the rust core
+            # gives it: data (1), never retried, and the hint names the group.
+            if status == 405 and method == "PUT":
+                raise ReadOnlyError(
+                    f"read-only: {url}: HTTP {status}",
+                    status=status,
+                    hint=(
+                        "the repository answered 405 to a write: a group repository is read-only "
+                        "(target a hosted member), a hosted one needs the write role, and a host "
+                        "without PUT support refuses the same way; that write changed nothing, "
+                        "so rerunning is safe"
+                    ),
+                )
             raise HttpError(
                 f"http: {url}: HTTP {status}",
                 status=status,

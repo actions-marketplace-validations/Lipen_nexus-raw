@@ -10,6 +10,7 @@ Read access works for any user the server answers.
 
 | Intent | Command | Success looks like | Exit |
 |:--|:--|:--|:--|
+| which repositories exist? | `nxr service repos <url>` | `name format type url` per line | 0 |
 | is the server alive? | `nxr service status <url>` | `alive` / `alive, writable` | 0 |
 | what repository is this? | `nxr service repo <url>` | `name format type url` | 0 |
 | what is where (any format)? | `nxr service assets <repo-url>` | NDJSON lines `asset` + `summary` | 0 |
@@ -65,9 +66,8 @@ A private CA is `--ca-bundle ca.pem` (or `NXR_CA_BUNDLE`). The bundle carries th
 - A repository filled by an external publisher may be only partly visible through the search API: some subtrees are indexed, some are not.
   When the listing looks short, check presence by name with `head`/`get`. `service assets` goes through the same search and sees the same gap.
 - `/-/` in paths is an npm protocol segment (dist-tags, tarballs), not part of the nxr protocol.
-- A raw repository holds arbitrary foreign files: spaces, brackets, Unicode.
-  `ls`/`down`/`diff` show and download them.
-  The `[A-Za-z0-9._-]` alphabet only limits what nxr itself writes.
+- A raw repository can hold foreign files: spaces, brackets, Unicode.
+  The tree `ls` shows them, but a transfer needs the `[A-Za-z0-9._-]` alphabet: an enumeration hides such a name and names the count, so `down --ls` cannot fetch it.
 - npm repositories: browse them through `nxr service assets`.
   Downloading packages is the npm client's job (`npm view`/`npm pack --registry ...`).
 

@@ -26,6 +26,12 @@ pub struct Entry {
     pub name: String,
     /// Whether the child has a subtree below it.
     pub kind: EntryKind,
+    /// The artifact's size in bytes, when the search answer carried it.
+    /// A folder has no size of its own.
+    pub size: Option<u64>,
+    /// The artifact's sha256, when the search answer carried it.
+    /// A folder has no digest of its own.
+    pub digest: Option<Digest>,
 }
 
 /// Whether an entry is a folder or a leaf file.
@@ -65,12 +71,18 @@ pub async fn search_entries_counted(
     dir_url: &str,
 ) -> Result<(Vec<Entry>, usize), Error> {
     let (repo, prefix) = split_prefix(dir_url)?;
-    let paths = paginate(client, dir_url, &repo, scope_path(&prefix).as_deref()).await?;
+    // The search answer carries the per-asset facts, and they cost nothing here:
+    // the walk already parsed them. A folder row keeps none, a file row keeps
+    // what the server reported (an old or proxy-fronted index may report
+    // neither, so both stay optional).
+    let assets = walk(client, dir_url, &repo, scope_path(&prefix).as_deref()).await?;
     let mut dirs = std::collections::BTreeSet::new();
-    let mut files = std::collections::BTreeSet::new();
+    let mut files: std::collections::BTreeMap<String, (Option<u64>, Option<Digest>)> =
+        std::collections::BTreeMap::new();
     let mut hidden = 0usize;
-    for path in paths {
-        let segs: Vec<String> = path
+    for asset in assets {
+        let segs: Vec<String> = asset
+            .path
             .split('/')
             .filter(|s| !s.is_empty())
             .map(percent_decode)
@@ -89,7 +101,20 @@ pub async fn search_entries_counted(
                 hidden += 1;
                 continue;
             }
-            files.insert(first.clone());
+            // Two served paths that decode to one name (a raw `a b.zip` and a
+            // `a%20b.zip`) collide here: the row may carry one object's facts or
+            // none, never the other object's. A collision drops the facts, which
+            // is honest, and a later duplicate cannot resurrect them.
+            let facts = (asset.size, asset.sha256);
+            match files.get(first) {
+                Some(existing) if existing != &facts => {
+                    files.insert(first.clone(), (None, None));
+                }
+                Some(_) => {}
+                None => {
+                    files.insert(first.clone(), facts);
+                }
+            }
         } else {
             dirs.insert(first.clone());
         }
@@ -99,10 +124,14 @@ pub async fn search_entries_counted(
         .map(|name| Entry {
             name,
             kind: EntryKind::Dir,
+            size: None,
+            digest: None,
         })
-        .chain(files.into_iter().map(|name| Entry {
+        .chain(files.into_iter().map(|(name, (size, digest))| Entry {
             name,
             kind: EntryKind::File,
+            size,
+            digest,
         }))
         .collect();
     Ok((entries, hidden))
@@ -117,10 +146,28 @@ pub async fn search_assets(
     client: &NexusClient,
     dir_url: &str,
 ) -> Result<Vec<ArtifactName>, Error> {
+    Ok(search_assets_counted(client, dir_url).await?.0)
+}
+
+/// The same listing, with the number of names it left out.
+///
+/// A server can hold a name outside the artifact grammar (a space, a
+/// percent-decoded slash), and the search sees marker names too. Neither is an
+/// artifact this client can transfer: both are skipped, and the caller names the
+/// count, so a short listing stays a fact and not a silent surprise.
+///
+/// # Errors
+///
+/// The same as [`search_assets`].
+pub async fn search_assets_counted(
+    client: &NexusClient,
+    dir_url: &str,
+) -> Result<(Vec<ArtifactName>, usize), Error> {
     let parts = split_base(dir_url)?;
     let scope = directory_scope(&parts.group, &parts.version);
     let paths = paginate(client, dir_url, &parts.repo, scope.as_deref()).await?;
     let mut names = Vec::new();
+    let mut skipped = 0usize;
     for path in paths {
         let rel = drop_segments(&path, parts.group.len());
         let Some(rel) = rel.strip_prefix(&format!("{}/", parts.version)) else {
@@ -129,17 +176,22 @@ pub async fn search_assets(
         if rel.is_empty() {
             continue;
         }
-        // The search sees markers too, and a marker name carries the reserved
-        // suffix: it is not an artifact, so skip it instead of failing the
-        // whole listing on it.
+        // The search sees markers too: they are derived data, hidden by design
+        // like the tree listing hides them, so they are not counted as skipped.
+        if rel.ends_with(".sha256") {
+            continue;
+        }
+        // Any other name outside the grammar cannot be transferred: skip it and
+        // let the caller name the count.
         let Ok(name) = ArtifactName::parse(rel) else {
+            skipped += 1;
             continue;
         };
         names.push(name);
     }
     names.sort();
     names.dedup();
-    Ok(names)
+    Ok((names, skipped))
 }
 
 /// Every artifact name under a repository prefix, with the search-reported
@@ -165,22 +217,41 @@ pub async fn search_repo_assets(
     client: &NexusClient,
     base: &str,
 ) -> Result<Vec<(ArtifactName, Option<Digest>, Option<u64>)>, Error> {
+    Ok(search_repo_assets_counted(client, base).await?.0)
+}
+
+/// The same walk with the number of names it left out.
+///
+/// Markers are hidden by design and not counted.
+/// A name outside the artifact grammar cannot be transferred, so it is skipped
+/// and counted, and the caller names it: a backup must not lose an object
+/// silently.
+///
+/// # Errors
+///
+/// The same as [`search_repo_assets`].
+pub async fn search_repo_assets_counted(
+    client: &NexusClient,
+    base: &str,
+) -> Result<(Vec<(ArtifactName, Option<Digest>, Option<u64>)>, usize), Error> {
     let (repo, prefix) = split_prefix(base)?;
     let assets = walk(client, base, &repo, None).await?;
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     for asset in assets {
         let rel = drop_segments(&asset.path, prefix.len());
         if rel.is_empty() || rel.ends_with(".sha256") {
             continue;
         }
         let Ok(name) = ArtifactName::parse(&rel) else {
+            skipped += 1;
             continue;
         };
         out.push((name, asset.sha256, asset.size));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out.dedup_by(|a, b| a.0 == b.0);
-    Ok(out)
+    Ok((out, skipped))
 }
 
 /// The same walk as [`search_assets`], carrying the search-reported facts per name:
@@ -193,6 +264,10 @@ pub async fn search_repo_assets(
 /// The walk stays repository-wide on purpose: this is the delta's remote side, where a
 /// narrowed page set would report existing objects as absent, so `q` is not sent.
 ///
+/// The second element is how many names the walk left out because they are
+/// outside the artifact grammar: no transfer can carry them, and the caller
+/// names the count instead of losing them silently.
+///
 /// # Errors
 ///
 /// Returns [`Error::Misuse`] when `dir_url` is not a directory URL and [`Error::Enumerate`] when the search endpoint is unavailable or unparseable.
@@ -201,11 +276,12 @@ pub async fn search_repo_assets(
 pub(crate) async fn search_assets_facts(
     client: &NexusClient,
     dir_url: &str,
-) -> Result<Vec<(ArtifactName, crate::sync::delta::Side)>, Error> {
+) -> Result<(Vec<(ArtifactName, crate::sync::delta::Side)>, usize), Error> {
     let parts = split_base(dir_url)?;
     let assets = walk(client, dir_url, &parts.repo, None).await?;
     let version_prefix = format!("{}/", parts.version);
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     for asset in assets {
         let rel = drop_segments(&asset.path, parts.group.len());
         let Some(rel) = rel.strip_prefix(&version_prefix) else {
@@ -214,10 +290,13 @@ pub(crate) async fn search_assets_facts(
         if rel.is_empty() {
             continue;
         }
-        // The search sees markers too, and a marker name carries the reserved
-        // suffix: it is not an artifact, so skip it instead of failing the
-        // whole listing on it.
+        // The search sees markers too: they are derived data, hidden by design,
+        // so they are not counted as skipped.
+        if rel.ends_with(".sha256") {
+            continue;
+        }
         let Ok(name) = ArtifactName::parse(rel) else {
+            skipped += 1;
             continue;
         };
         out.push((
@@ -230,7 +309,7 @@ pub(crate) async fn search_assets_facts(
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out.dedup_by(|a, b| a.0 == b.0);
-    Ok(out)
+    Ok((out, skipped))
 }
 
 /// The audit listing: every repository object as served, markers included,
@@ -268,6 +347,20 @@ pub(crate) async fn audit_tree(
     Ok(out)
 }
 
+/// The repository name a directory URL points inside.
+///
+/// A caller that serves a whole directory tree before its first listing (the
+/// mount) refuses a wrongly shaped URL at startup: a URL outside
+/// `/repository/<name>/...` can never be listed, and serving an empty tree would
+/// hide the reason.
+///
+/// # Errors
+///
+/// Returns [`Error::Misuse`] with the message every search-backed listing carries.
+pub fn repository_of(url: &str) -> Result<String, Error> {
+    split_prefix(url).map(|(repo, _)| repo)
+}
+
 struct BaseParts {
     repo: String,
     group: Vec<String>,
@@ -278,7 +371,9 @@ struct BaseParts {
 pub(crate) fn split_prefix(base: &str) -> Result<(String, Vec<String>), Error> {
     let err = || {
         Error::misuse(format!(
-            "URL {base:?} must point inside /repository/<name>/<group…>/"
+            "URL {base:?} must point inside /repository/<name>/<group…>/: the search needs the \
+             repository name from the URL, so pass --name or --names-from on a host without \
+             the search API"
         ))
     };
     let url = reqwest::Url::parse(base).map_err(|_| err())?;
@@ -300,7 +395,9 @@ pub(crate) fn split_prefix(base: &str) -> Result<(String, Vec<String>), Error> {
 fn split_base(base: &str) -> Result<BaseParts, Error> {
     let err = || {
         Error::misuse(format!(
-            "URL {base:?} must point inside /repository/<name>/<group…>/<version>/"
+            "URL {base:?} must point inside /repository/<name>/<group…>/<version>/: the search needs the \
+             repository name and a version scope from the URL, so pass --name or --names-from on a \
+             host without the search API"
         ))
     };
     let url = reqwest::Url::parse(base).map_err(|_| err())?;
@@ -458,7 +555,13 @@ async fn walk(
                         .and_then(|c| c.get("sha256"))
                         .and_then(|s| s.as_str())
                         .and_then(|s| Digest::from_hex(s).ok()),
-                    size: item.get("size").and_then(|s| s.as_u64()),
+                    // The real search answer carries the size as `fileSize`
+                    // (measured against the pinned 3.96.3). `size` is kept as a
+                    // fallback for a proxy or a fixture that reports the flat form.
+                    size: item
+                        .get("fileSize")
+                        .or_else(|| item.get("size"))
+                        .and_then(|s| s.as_u64()),
                 });
             }
         }
@@ -492,6 +595,29 @@ pub(crate) async fn search_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_of_takes_the_shape_a_listing_needs() {
+        assert_eq!(
+            repository_of("http://h/repository/raw-main/").unwrap(),
+            "raw-main"
+        );
+        assert_eq!(
+            repository_of("http://h/repository/raw-main/1.0.0/").unwrap(),
+            "raw-main"
+        );
+        // Outside /repository/: no repository name to derive, so no listing.
+        for url in [
+            "http://h/repo/",
+            "http://h/",
+            "http://h/repository/",
+            "http://h/raw/main/",
+        ] {
+            let err = repository_of(url).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{url}");
+            assert!(matches!(err, Error::Misuse(_)), "{url}");
+        }
+    }
 
     /// An endpoint that never stops emitting continuation tokens hits the page cap and is refused, instead of scrolling forever.
     #[tokio::test]

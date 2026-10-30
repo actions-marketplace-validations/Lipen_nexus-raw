@@ -15,11 +15,13 @@ import base64
 import contextlib
 import hashlib
 import http.client
+import http.server
 import json
 import os
 import pathlib
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -289,6 +291,30 @@ class Conformance(unittest.TestCase):
             info = nx.head(mock.url("ghost.zip"))
             self.assertEqual(info, nxr.HeadInfo(404, None, None))
             self.assertEqual(len(nx.requests), 3, "misses must not retry")
+
+    def test_static_host_reads_and_refuses_writes(self):
+        """A bare static host: reads and markers work, every write is the read-only refusal, and there is no search API."""
+        seed = tempfile.TemporaryDirectory()
+        self.addCleanup(seed.cleanup)
+        # The seed path is the store key: `mock.url` serves `{VERSION}/{name}`.
+        version = pathlib.Path(seed.name, VERSION)
+        version.mkdir()
+        (version / "a.bin").write_bytes(CONTENT)
+        (version / "a.bin.sha256").write_bytes(nxr.format_marker("a.bin", hashlib.sha256(CONTENT).hexdigest()).encode())
+        with mock_server("static-host", "--seed-dir", seed.name) as mock:
+            nx = self.client()
+            url = mock.url("a.bin")
+            self.assertEqual(nx.get(url), CONTENT)
+            info = nx.head(url)
+            self.assertEqual(info.status, 200)
+            self.assertEqual(info.length, len(CONTENT))
+            with self.assertRaises(nxr.ReadOnlyError) as raised:
+                nx.put(mock.url("new.bin"), CONTENT)
+            self.assertEqual(raised.exception.status, 405)
+            self.assertEqual(raised.exception.exit_code, 1)
+            self.assertIn("group", raised.exception.hint)
+            with self.assertRaises(nxr.EnumerateError):
+                nx.ls(mock.base, "raw-main", VERSION)
 
     def test_atomic_channel(self):
         """A channel is a token file: set writes one line, get reads it back, an unset channel reads None."""
@@ -813,6 +839,55 @@ class Reference(unittest.TestCase):
             with self.assertRaises(nxr.NxrError, msg=token):
                 nx.channel_set("http://127.0.0.1:1/latest", token)
         self.assertEqual(nx.requests, [], "the refusal must precede the wire")
+
+
+class GroupWrites(unittest.TestCase):
+    """Deployments that are not scenarios: a group repository refuses every write.
+
+    Kept outside `Conformance`, whose methods map one-to-one onto the scenario
+    table: a group is a deployment kind (`MockNexus::start_group` on the Rust
+    side), not a row the mock lists.
+    """
+
+    def test_the_error_classes_are_exported(self):
+        """Every documented error class is importable with `from nxr import *`."""
+        for name in ("NxrError", "ReadOnlyError", "AuthError", "MisuseError", "UnsafeName"):
+            self.assertIn(name, nxr.__all__)
+
+    def test_a_405_to_a_put_is_the_read_only_verdict(self):
+        """A 405 to a PUT is the read-only refusal, not an auth or transport one.
+
+        A group repository answers 405 to every write: the class is exit 1, the
+        attempt is never retried, and the hint names the group.
+        """
+
+        class Refusing(http.server.BaseHTTPRequestHandler):
+            puts = 0
+
+            def do_PUT(self):
+                Refusing.puts += 1
+                self.send_response(405)
+                self.send_header("Allow", "GET,HEAD")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Refusing)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            nx = nxr.Nxr()
+            url = f"http://127.0.0.1:{server.server_port}/repository/raw/x/a.bin"
+            with self.assertRaises(nxr.ReadOnlyError) as raised:
+                nx.put(url, CONTENT)
+            self.assertEqual(raised.exception.status, 405)
+            self.assertEqual(raised.exception.exit_code, 1)
+            self.assertIn("group", raised.exception.hint)
+            self.assertEqual(Refusing.puts, 1, "a refused write is never retried")
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

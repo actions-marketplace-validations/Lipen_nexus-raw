@@ -22,6 +22,17 @@ fn pressed(key: &KeyEvent, expected: char) -> bool {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 }
 
+/// Whether a server-supplied relative path is one safe local path: every
+/// segment is one ordinary component (the rule [`config::safe_dir_name`] states
+/// for a name, applied per segment).
+///
+/// The protocol's artifact grammar is not the rule here: a folder the server
+/// names `Release Notes` is a perfectly safe local directory, while a segment
+/// with a decoded `/`, a `..` or a control byte is not.
+fn safe_rel(rel: &str) -> bool {
+    !rel.is_empty() && rel.split('/').all(crate::config::safe_dir_name)
+}
+
 /// A text character for an input field: Shift is part of the character,
 /// so uppercase paths and names type as typed.
 fn text_char(key: &KeyEvent) -> Option<char> {
@@ -37,7 +48,7 @@ fn text_char(key: &KeyEvent) -> Option<char> {
     }
 }
 use nexus_raw_core::service::RepoInfo;
-use nexus_raw_core::{ArtifactName, Dir, Entry, EntryKind, Error, HeadInfo, Summary};
+use nexus_raw_core::{ArtifactName, Digest, Dir, Entry, EntryKind, Error, HeadInfo, Summary};
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 use tokio::sync::mpsc;
@@ -132,18 +143,20 @@ pub struct Row {
     pub expanded: bool,
     /// Whether this folder's children are loading.
     pub loading: bool,
+    /// The search-reported size, when the listing carried it.
+    pub size: Option<u64>,
+    /// The search-reported digest, when the listing carried it.
+    pub digest: Option<Digest>,
 }
 
 impl Tab {
     /// A fresh tab over a bootstrapped repository list.
     #[must_use]
     pub fn new(server: ServerCfg, repos: Vec<RepoInfo>) -> Self {
-        // A compromised server can name a repository on another origin: the
-        // session credentials never follow such a URL. Drop it at ingest.
-        let repos = repos
-            .into_iter()
-            .filter(|repo| server.same_origin(&repo.url))
-            .collect();
+        // A compromised server can name a repository on another origin, or give
+        // it a name that would escape the destination as a local path. Neither
+        // row is shown: the refresh path filters through the same function.
+        let repos = crate::config::acceptable_repos(&server, repos);
         Self {
             server,
             screen: Screen::Repos,
@@ -206,6 +219,8 @@ impl Tab {
                 depth,
                 expanded,
                 loading,
+                size: entry.size,
+                digest: entry.digest.clone(),
             };
             let expand_into = expanded;
             out.push(row);
@@ -2104,6 +2119,10 @@ impl App {
             format!("{}/{}", path.join("/"), row.rel)
         };
         let url = format!("{}{}", t.here_url(), row.rel);
+        // The listing may already carry the facts (the search answer does): a
+        // known size and digest show at once and cost no request. A missing
+        // fact keeps the background probe, the old behavior.
+        let (size, digest) = (row.size, row.digest.clone());
         let card = FileCard {
             tab: self.tab,
             gen: t.gen,
@@ -2111,21 +2130,28 @@ impl App {
             rel: rel.clone(),
             url: url.clone(),
             repo: RepoRow::from(&repo),
-            size: SizeState::Pending,
-            sha: ShaState::Pending,
+            size: size.map_or(SizeState::Pending, SizeState::Known),
+            sha: digest
+                .as_ref()
+                .map_or(ShaState::Pending, |d| ShaState::Hex(d.as_str().to_owned())),
         };
         self.mode = Mode::Card(Card::File(Box::new(card)));
-        self.pending += 2;
+        let pending = u8::from(size.is_none()) + u8::from(digest.is_none());
+        self.pending += usize::from(pending);
         let (tab, gen, session) = (self.tab, t.gen, self.session.clone());
-        net::head_size(
-            self.tx.clone(),
-            tab,
-            gen,
-            rel.clone(),
-            url.clone(),
-            session.clone(),
-        );
-        net::fetch_sibling(self.tx.clone(), tab, gen, rel, url, session);
+        if size.is_none() {
+            net::head_size(
+                self.tx.clone(),
+                tab,
+                gen,
+                rel.clone(),
+                url.clone(),
+                session.clone(),
+            );
+        }
+        if digest.is_none() {
+            net::fetch_sibling(self.tx.clone(), tab, gen, rel, url, session);
+        }
     }
 
     fn open_servers_overlay(&mut self) {
@@ -2182,7 +2208,7 @@ impl App {
         self.connecting += 1;
         self.connect_open = true;
         self.pending += 1;
-        self.status = format!("connecting to {}…", server.url);
+        self.status = format!("connecting to {}…", config::shown_url(&server.url));
         net::load_repos(
             self.tx.clone(),
             server,
@@ -2571,7 +2597,7 @@ impl App {
             .iter()
             .filter_map(|name| {
                 rows.iter()
-                    .find(|r| &r.name == name)
+                    .find(|r| &r.name == name && self.repo_allowed(r))
                     .map(|repo| Retry::Walk {
                         repo: repo.clone(),
                         rel: String::new(),
@@ -2598,10 +2624,19 @@ impl App {
         let repo_row = RepoRow::from(&repo);
         let root = repo_row.dir_url();
         let mut items = Vec::new();
+        let mut refused = 0usize;
         for rel in marks {
             let Some(row) = rows.iter().find(|r| r.rel == rel) else {
                 continue;
             };
+            // A server-chosen path becomes a local path below the destination:
+            // an unsafe segment, or a name the filesystem cannot hold as one
+            // component (a decoded `/`), is refused here instead of escaping
+            // the anchor or truncating to the wrong object.
+            if !safe_rel(&rel) || !crate::config::safe_dir_name(&row.name) {
+                refused += 1;
+                continue;
+            }
             match row.kind {
                 EntryKind::Dir => items.push(Retry::Walk {
                     repo: repo_row.clone(),
@@ -2621,6 +2656,9 @@ impl App {
                 }
             }
         }
+        if refused > 0 {
+            self.status = format!("refused {refused} unsafe name(s) from the server");
+        }
         self.start_queue(items);
     }
 
@@ -2632,6 +2670,27 @@ impl App {
         }
         if self.transfer_busy() {
             self.status = "transfer in flight: one at a time".into();
+            return;
+        }
+        // The last line of defence for the queue: every file target sits under
+        // its own destination. The constructors validate the names already, and
+        // a new one must not be able to skip that.
+        let mut refused = 0usize;
+        let items: Vec<Retry> = items
+            .into_iter()
+            .filter(|item| match item {
+                Retry::Get { out, dst, .. } if !out.starts_with(dst) => {
+                    refused += 1;
+                    false
+                }
+                _ => true,
+            })
+            .collect();
+        if items.is_empty() {
+            // Nothing survived: the refusal is the only thing to report.
+            if refused > 0 {
+                self.status = format!("refused {refused} item(s) outside the destination");
+            }
             return;
         }
         self.queue = items.into_iter().collect();
@@ -2754,12 +2813,11 @@ impl App {
             }
             SaveAsField::Name => {
                 let name = dialog.name.trim().to_owned();
-                if name.is_empty() || name == "." || name == ".." {
-                    self.status = "the name is empty or a dot segment".into();
-                    return;
-                }
-                if name.contains('/') || name.contains('\\') || name.contains('\0') {
-                    self.status = "the name carries a slash or a nul byte".into();
+                // The typed name becomes a local directory: one safe component,
+                // the rule the server-chosen names obey (no dot segment, no
+                // slash, nothing the platform would normalize away).
+                if !config::safe_dir_name(&name) {
+                    self.status = "the name must be one ordinary folder name".into();
                     return;
                 }
                 let raw_dir = dialog.dir.trim().to_owned();
@@ -2799,15 +2857,35 @@ impl App {
             depth: 0,
             expanded: false,
             loading: false,
+            size: None,
+            digest: None,
         };
         self.mode = Mode::Card(Card::File(card));
         self.download_file(path, &row, self.destination.clone(), false);
     }
 
     /// The whole repository of one row into `{anchor}/{repo.name}`.
+    ///
+    /// The row may have arrived through a refresh, so the origin and the name
+    /// are checked here again: the destination is a local path and the walk
+    /// carries the session credentials.
     fn download_repo(&mut self, repo: &RepoRow) {
+        if !self.repo_allowed(repo) {
+            self.status =
+                "refused: the repository is on another origin or has an unsafe name".into();
+            return;
+        }
         let dst = self.anchor_base().join(&repo.name);
         self.begin_walk(repo.clone(), String::new(), dst, false);
+    }
+
+    /// Whether a repository row may be downloaded: one origin with the session,
+    /// and a name that is safe as a single directory name.
+    fn repo_allowed(&self, repo: &RepoRow) -> bool {
+        let Some(t) = self.tabs.get(self.tab) else {
+            return false;
+        };
+        t.server.same_origin(&repo.url) && crate::config::safe_dir_name(&repo.name)
     }
 
     /// One file with the direct get primitive, digest-checked against the
@@ -2826,13 +2904,29 @@ impl App {
             return;
         };
         let rel = self.full_rel(&path, &row.rel);
-        let url = format!("{}{}", t.here_url(), row.rel);
+        // The file's own name and every breadcrumb segment must be one safe
+        // component: a decoded `/` in a listing entry is not a name the
+        // filesystem can hold, and a `..` would leave the destination, while
+        // spaces and unicode are ordinary names for the filesystem.
+        if !crate::config::safe_dir_name(&row.name) || !safe_rel(&rel) {
+            self.status = format!("refused: an unsafe path segment in {}", rel.escape_debug());
+            return;
+        }
+        // The URL is the repository root plus the name's path from it. The tab
+        // position is already inside `rel` (`full_rel` prepends it), so
+        // `here_url` would double it, and a card opened on a row of an expanded
+        // folder would drop the folder.
+        let repo_row = RepoRow::from(&repo);
+        let url = format!("{}{}", repo_row.dir_url(), rel);
         let out = if flat {
             base.join(&row.name)
         } else {
             base.join(&rel)
         };
-        let repo_row = RepoRow::from(&repo);
+        if !out.starts_with(&base) {
+            self.status = "refused: the name escapes the destination".into();
+            return;
+        }
         self.transfer = Some(Transfer {
             repo_url: repo_row.dir_url(),
             server: Some(host_of(&repo_row.url)),
@@ -2946,9 +3040,11 @@ impl App {
         match res {
             Ok(repos) if slot < self.tabs.len() => {
                 // A refresh of an existing tab. The cursor returns to the row
-                // it sat on, by name.
+                // it sat on, by name. The same ingest filter applies: a refresh
+                // must not put a foreign-origin or unsafe-named row back.
                 let keep = self.tabs[slot].keep_cursor_name.take();
                 let t = &mut self.tabs[slot];
+                let repos = crate::config::acceptable_repos(&t.server, repos);
                 let count = repos.len();
                 t.repos = repos;
                 t.loading = false;
@@ -2967,7 +3063,10 @@ impl App {
                 if !self.servers.iter().any(|s| s.url == server.url) {
                     self.servers.push(server.clone());
                 }
-                self.status = format!("server {} connected, press s to open", server.url);
+                self.status = format!(
+                    "server {} connected, press s to open",
+                    config::shown_url(&server.url)
+                );
             }
             Ok(_repos) if self.tabs.iter().any(|t| t.server.url == server.url) => {
                 // A duplicate connect: focus the tab that is already open.
@@ -2980,8 +3079,11 @@ impl App {
             }
             Ok(repos) => {
                 // A new server: the tab opens and the server joins the config.
-                let count = repos.len();
-                self.tabs.push(Tab::new(server.clone(), repos));
+                // The count is the tab's own: the ingest filter drops rows, and
+                // the status must not promise more than the screen shows.
+                let tab = Tab::new(server.clone(), repos);
+                let count = tab.repos.len();
+                self.tabs.push(tab);
                 self.tab = self.tabs.len() - 1;
                 self.mode = Mode::Normal;
                 self.status = format!(
@@ -3009,7 +3111,7 @@ impl App {
                 });
                 let ctx = ErrCtx {
                     server: Some(if connect {
-                        server.url.clone()
+                        config::shown_url(&server.url)
                     } else {
                         server.name.clone()
                     }),
@@ -3533,7 +3635,7 @@ pub fn cause_of(e: &Error) -> String {
             url.escape_debug()
         ),
         Error::ReadOnly { url, status, .. } => format!(
-            "the repository '{}' answered HTTP {status} to a deletion, it is read-only",
+            "the repository '{}' answered HTTP {status} to a write, it is read-only (a group repository refuses writes)",
             url.escape_debug()
         ),
         Error::Misuse(_) => "the request is malformed and cannot be retried".to_owned(),
@@ -3673,6 +3775,190 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_repo_name_that_escapes_the_destination_is_dropped() {
+        // The name becomes `{destination}/{name}` and the smoke run deletes it,
+        // so an absolute or dot-segment name must never reach a row.
+        for name in ["/home/user/.ssh", "..", "a/b"] {
+            let hostile = RepoInfo {
+                name: name.to_owned(),
+                format: "raw".to_owned(),
+                kind: "hosted".to_owned(),
+                url: "http://127.0.0.1:1/repository/x/".to_owned(),
+            };
+            let tab = tab_with(vec![repo("raw-main", "raw", "hosted"), hostile]);
+            assert_eq!(tab.repos.len(), 1, "{name} must not survive the ingest");
+        }
+    }
+
+    #[test]
+    fn a_refresh_does_not_reintroduce_a_hostile_repo() {
+        let (mut app, _rx) = app_with(
+            vec![tab_with(vec![repo("raw-main", "raw", "hosted")])],
+            false,
+        );
+        let foreign = RepoInfo {
+            name: "evil".to_owned(),
+            format: "raw".to_owned(),
+            kind: "hosted".to_owned(),
+            url: "http://evil.example/repository/evil/".to_owned(),
+        };
+        app.handle(Msg::Repos {
+            tab: 0,
+            server: server(),
+            connect: false,
+            res: Ok(vec![repo("raw-main", "raw", "hosted"), foreign]),
+        });
+        assert_eq!(
+            app.tabs[0].repos.len(),
+            1,
+            "a refresh filters exactly like the ingest"
+        );
+    }
+
+    #[test]
+    fn a_download_refuses_an_unsafe_listing_name() {
+        let (mut app, _rx) = app_with(vec![tree_tab(vec![])], false);
+        let base = PathBuf::from("dl");
+        // A server path with `%2F` decodes into one name that carries a slash.
+        for name in [
+            "/home/user/.bashrc",
+            "../../etc/passwd",
+            "sub/../evil",
+            "..",
+        ] {
+            let row = Row {
+                name: name.to_owned(),
+                rel: name.to_owned(),
+                kind: EntryKind::File,
+                depth: 0,
+                expanded: false,
+                loading: false,
+                size: None,
+                digest: None,
+            };
+            app.download_file(Vec::new(), &row, base.clone(), true);
+            assert!(app.transfer.is_none(), "{name} must never start a transfer");
+            assert!(app.status.starts_with("refused:"), "{name}: {}", app.status);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_queue_refuses_a_target_outside_its_destination() {
+        let (mut app, _rx) = app_with(vec![tree_tab(vec![])], false);
+        let repo = RepoRow {
+            name: "raw-main".into(),
+            format: "raw".into(),
+            kind: "hosted".into(),
+            url: "http://127.0.0.1:1/repository/raw-main/".into(),
+        };
+        app.start_queue(vec![
+            Retry::Get {
+                url: "http://x/a".into(),
+                out: PathBuf::from("/etc/passwd"),
+                dst: PathBuf::from("dl"),
+                repo: repo.clone(),
+            },
+            Retry::Get {
+                url: "http://x/b".into(),
+                out: PathBuf::from("dl/b"),
+                dst: PathBuf::from("dl"),
+                repo,
+            },
+        ]);
+        // The queue drains into the transfer slot: the valid item is in flight,
+        // the escaping one never started.
+        let started = match app.transfer.as_ref().and_then(|t| t.retry.as_ref()) {
+            Some(Retry::Get { url, .. }) => url.clone(),
+            other => panic!("expected the valid get to start, got {other:?}"),
+        };
+        assert_eq!(started, "http://x/b");
+        assert!(app.queue.is_empty());
+
+        // A queue where every target escapes reports the refusal instead of
+        // starting anything.
+        app.transfer = None;
+        app.start_queue(vec![Retry::Get {
+            url: "http://x/c".into(),
+            out: PathBuf::from("/etc/shadow"),
+            dst: PathBuf::from("dl"),
+            repo: RepoRow {
+                name: "raw-main".into(),
+                format: "raw".into(),
+                kind: "hosted".into(),
+                url: "http://127.0.0.1:1/repository/raw-main/".into(),
+            },
+        }]);
+        assert!(app.transfer.is_none(), "nothing may start");
+        assert!(app.status.starts_with("refused"), "{}", app.status);
+    }
+
+    #[tokio::test]
+    async fn a_download_takes_a_folder_name_with_a_space() {
+        let (mut app, _rx) = app_with(vec![tree_tab(vec![])], false);
+        let row = Row {
+            name: "x.bin".into(),
+            rel: "x.bin".into(),
+            kind: EntryKind::File,
+            depth: 0,
+            expanded: false,
+            loading: false,
+            size: None,
+            digest: None,
+        };
+        // Spaces and unicode are ordinary filesystem names: the protocol's
+        // artifact grammar is not the rule for a local directory.
+        app.download_file(
+            vec!["Release Notes".into()],
+            &row,
+            PathBuf::from("dl"),
+            false,
+        );
+        let started = app.transfer.as_ref().and_then(|t| t.retry.as_ref());
+        assert!(
+            matches!(started, Some(Retry::Get { out, .. }) if out == &PathBuf::from("dl/Release Notes/x.bin")),
+            "{started:?}"
+        );
+
+        // A `..` breadcrumb is still refused before anything starts.
+        app.transfer = None;
+        app.download_file(vec!["..".into()], &row, PathBuf::from("dl"), false);
+        assert!(app.transfer.is_none());
+        assert!(app.status.starts_with("refused"), "{}", app.status);
+
+        // A listing entry whose name carries a decoded `/` is not one local
+        // component: refusing it beats downloading the truncated tail.
+        app.transfer = None;
+        let split = Row {
+            name: "a/b".into(),
+            rel: "a/b".into(),
+            kind: EntryKind::File,
+            depth: 0,
+            expanded: false,
+            loading: false,
+            size: None,
+            digest: None,
+        };
+        app.download_file(Vec::new(), &split, PathBuf::from("dl"), false);
+        assert!(app.transfer.is_none());
+        assert!(app.status.starts_with("refused"), "{}", app.status);
+    }
+
+    #[test]
+    fn download_repo_refuses_a_row_outside_the_session_origin() {
+        let (mut app, _rx) = app_with(vec![tab_with(vec![])], false);
+        let row = RepoRow {
+            name: "raw-main".into(),
+            format: "raw".into(),
+            kind: "hosted".into(),
+            url: "http://evil.example/repository/raw-main/".into(),
+        };
+        app.download_repo(&row);
+        assert!(app.transfer.is_none(), "no walk starts");
+        assert!(app.queue.is_empty(), "nothing queues");
+        assert!(app.status.starts_with("refused:"), "{}", app.status);
+    }
+
     fn app_with(tabs: Vec<Tab>, all_formats: bool) -> (App, mpsc::UnboundedReceiver<Msg>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut app = App::new(
@@ -3707,10 +3993,22 @@ mod tests {
         tab
     }
 
+    /// An entry with the search facts the listing carries.
+    fn entry_with(name: &str, kind: EntryKind, size: u64, digest: &Digest) -> Entry {
+        Entry {
+            name: name.to_owned(),
+            kind,
+            size: Some(size),
+            digest: Some(digest.clone()),
+        }
+    }
+
     fn entry(name: &str, kind: EntryKind) -> Entry {
         Entry {
             name: name.to_owned(),
             kind,
+            size: None,
+            digest: None,
         }
     }
 
@@ -4093,6 +4391,66 @@ mod tests {
         assert_eq!(card.sha, ShaState::Absent);
     }
 
+    /// The listing's facts fill the card at once: no HEAD, no sibling GET.
+    #[tokio::test]
+    async fn the_card_takes_the_listing_facts() {
+        let body = b"hello\n";
+        let digest = Digest::of_bytes(body);
+        let (mut app, mut rx) = app_with(
+            vec![tree_tab(vec![entry_with(
+                "a.bin",
+                EntryKind::File,
+                body.len() as u64,
+                &digest,
+            )])],
+            false,
+        );
+        app.handle(Msg::Key(key(KeyCode::Enter)));
+        let Mode::Card(Card::File(card)) = app.mode.clone() else {
+            panic!("the card opens on enter");
+        };
+        assert_eq!(card.size, SizeState::Known(body.len() as u64));
+        assert_eq!(card.sha, ShaState::Hex(digest.as_str().to_owned()));
+        assert_eq!(app.pending, 0, "known facts spawn no probe");
+        // A spawned probe runs only when the test yields: without this, try_recv
+        // would pass even if both were queued.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rx.try_recv().is_err(), "no request is queued");
+    }
+
+    /// Only the size is known: the digest probe runs, and it is the only one.
+    #[tokio::test]
+    async fn the_card_probes_only_the_missing_fact() {
+        let mut tab = tree_tab(vec![Entry {
+            name: "a.bin".into(),
+            kind: EntryKind::File,
+            size: Some(6),
+            digest: None,
+        }]);
+        // An invalid base fails the probe at once: the test observes its
+        // message without waiting out the retry backoff, on every platform.
+        tab.repos[0].url = "not a url".into();
+        tab.repo = tab.repos.first().cloned();
+        let (mut app, mut rx) = app_with(vec![tab], false);
+        app.handle(Msg::Key(key(KeyCode::Enter)));
+        let Mode::Card(Card::File(card)) = app.mode.clone() else {
+            panic!("the card opens on enter");
+        };
+        assert_eq!(card.size, SizeState::Known(6));
+        assert_eq!(card.sha, ShaState::Pending);
+        assert_eq!(app.pending, 1, "exactly one probe is outstanding");
+        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the sibling probe answers")
+            .expect("a message");
+        assert!(
+            matches!(msg, Msg::Sibling { .. }),
+            "the digest is the missing fact: {msg:?}"
+        );
+    }
+
     #[tokio::test]
     async fn the_card_downloads_with_s_and_copies_with_c() {
         let (mut app, mut rx) = app_with(
@@ -4200,7 +4558,8 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
-        // A slash in the name is refused before anything happens.
+        // A slash in the name is refused before anything happens: the typed
+        // name must be one ordinary folder name.
         app.handle(Msg::Key(key(KeyCode::Char('D'))));
         let Mode::SaveAs(dialog) = app.mode.clone() else {
             panic!("D opens the dialog");
@@ -4211,7 +4570,11 @@ mod tests {
         }
         let before = app.pending;
         app.handle(Msg::Key(key(KeyCode::Enter)));
-        assert!(app.status.contains("slash"), "{:?}", app.status);
+        assert!(
+            app.status.contains("ordinary folder name"),
+            "{:?}",
+            app.status
+        );
         assert_eq!(app.pending, before, "nothing spawned");
         assert!(matches!(app.mode, Mode::SaveAs(_)));
         let _ = dialog;
@@ -6244,6 +6607,31 @@ mod tests {
         assert!(saved.servers.is_empty(), "the config stays untouched");
     }
 
+    /// A card opened on a row inside an expanded folder downloads from the
+    /// folder's URL, not from the tab root: the name's path is in the card.
+    #[tokio::test]
+    async fn the_card_downloads_the_expanded_row_url() {
+        let (mut app, _rx) = app_with(vec![tree_tab(vec![entry("a", EntryKind::Dir)])], false);
+        let repo = RepoRow::from(&app.tabs[0].repos[0]);
+        let card = Card::File(Box::new(FileCard {
+            tab: 0,
+            gen: app.tabs[0].gen,
+            name: "c.txt".into(),
+            rel: "a/c.txt".into(),
+            url: format!("{}a/c.txt", repo.dir_url()),
+            repo,
+            size: SizeState::Pending,
+            sha: ShaState::Pending,
+        }));
+        app.card_download(card);
+        let download = app.transfer.expect("the card download starts");
+        let Retry::Get { url, out, .. } = download.retry.expect("the get retry") else {
+            panic!("the card download retries as a get");
+        };
+        assert!(url.ends_with("/a/c.txt"), "{url}");
+        assert!(out.ends_with("a/c.txt"), "{out:?}");
+    }
+
     #[tokio::test]
     async fn the_card_downloads_a_nested_file_once() {
         let (mut app, mut rx) = app_with(
@@ -6308,7 +6696,7 @@ mod tests {
             res: Ok(vec![repo("raw", "raw", "hosted")]),
         });
         assert_eq!(app.tabs.len(), 1, "no tab opens after the cancel");
-        assert_eq!(app.status, "server http://x:2/ connected, press s to open");
+        assert_eq!(app.status, "server http://x:2 connected, press s to open");
         let saved = crate::config::load(&path).unwrap();
         assert!(saved.servers.is_empty(), "the config stays untouched");
         // The overlay knows the server, so `s` can still open it.

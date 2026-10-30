@@ -320,17 +320,9 @@ async fn finish_download(
     if let Err(e) = tokio::fs::rename(part, &final_bytes).await {
         return Err((name.clone(), Outcome::Failed(Error::io(&final_bytes, e))));
     }
-    let marker = sibling::format_line(name.as_str(), &actual);
     let sib_final = sibling_path(dir, name);
-    let marker_write = async {
-        let mut f = crate::transport::client::write_options(false)
-            .open(&sib_final)
-            .await?;
-        f.write_all(marker.as_bytes()).await?;
-        f.flush().await
-    };
-    if let Err(e) = marker_write.await {
-        return Err((name.clone(), Outcome::Failed(Error::io(&sib_final, e))));
+    if let Err(e) = sibling::write_marker(&sib_final, name.as_str(), &actual).await {
+        return Err((name.clone(), Outcome::Failed(e)));
     }
     if emit_done {
         client
@@ -468,8 +460,8 @@ async fn download_segmented(
     let bytes_url = client.object_url(dir_url, name);
     let total = match size_hint {
         Some(total) => total,
-        None => match client.head_info(&bytes_url).await {
-            Ok(info) if (200..300).contains(&info.status) => match info.size {
+        None => match client.head_transfer(&bytes_url).await {
+            Ok(info) => match info.size {
                 Some(total) => total,
                 None => {
                     return single_stream(
@@ -478,15 +470,6 @@ async fn download_segmented(
                     .await;
                 }
             },
-            Ok(info) => {
-                return Err((
-                    name.clone(),
-                    Outcome::Failed(Error::Http {
-                        status: info.status,
-                        url: bytes_url,
-                    }),
-                ));
-            }
             Err(e) => return Err((name.clone(), Outcome::Failed(e))),
         },
     };
@@ -686,7 +669,7 @@ fn alive(_pid: u32) -> bool {
 /// directory: `create_dir_all` and `rename` follow intermediate symlinks, so a planted
 /// `bom -> ~/.config` would land the artifact outside the destination.
 /// The root itself is the caller's choice and stays allowed.
-pub(crate) fn ensure_symlink_free(parent: &Path, root: &Path) -> Result<(), Error> {
+pub fn ensure_symlink_free(parent: &Path, root: &Path) -> Result<(), Error> {
     let mut cur = parent.to_owned();
     while cur.starts_with(root) && cur != root {
         match std::fs::symlink_metadata(&cur) {

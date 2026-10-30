@@ -40,6 +40,7 @@ PUT https://nexus.example.com/repository/raw-main/1.4.0/bom/linux-x86_64.json.sh
 A group URL is a read-only aggregation over several hosted repositories: a read is dispatched to the members in order and the first member answering `2xx` serves the object.
 A member's `404` (or any other non-2xx answer, or a broken connection) falls through to the next member, and when nobody answers `2xx` the group answers a plain `404`.
 Writes never reach a member: `PUT` and `DELETE` (like every method but `GET`/`HEAD`) are refused with `405`, an `Allow: GET,HEAD` header and no body, so publication targets hosted members only.
+A client reads that `405` as the read-only refusal: exit `1`, a hint naming the group, and no member contacted.
 The dispatch mirrors the real Nexus group handler: the method switch at `GroupHandler.java:103-112` and the first-2xx member walk (`getFirst`) at `GroupHandler.java:124-166` of `nexus-public`.
 The search API is a separate subsystem in real Nexus (it reads the metadata database, not the group dispatch), so group search is not modeled.
 
@@ -111,6 +112,8 @@ The token must be exactly one non-empty line with no CR.
 | `1.10.0` vs `1.9.9` | forward: segments compare numerically |
 | `1.4.0` vs `1.14.0` | backward: `4 < 14` numerically |
 | `1.0.0` vs `1.0.0-rc1` | forward: a release beats its own prerelease |
+| `1.0.0-rc2` vs `1.0.0-rc1` | forward: the suffix compares lexicographically |
+| `1.0.0-rc10` vs `1.0.0-rc9` | backward: text order, so `rc10` sorts before `rc9`, and only a forced set (no `--if-forward`) moves it |
 
 The channel ref is the only mutable state besides version directories, and writes are plain PUTs.
 
@@ -189,7 +192,11 @@ Upload:
 
 Marker-after-bytes is what makes `Markerless` mean "under-uploaded": a client never trusts a marker whose bytes are absent, and a crash between steps 2 and 3 is recoverable by design.
 A local sibling that does not match its bytes stops the run at step 1.
-The file is never touched and nothing is uploaded.
+The file is never touched and nothing is uploaded: the repair is to delete the stale sibling, which the next scan regenerates from the bytes, or to restore the bytes.
+
+A PUT answered `405` is the read-only refusal, the same class a `DELETE` gets: exit `1`, never retried, and the hint names the group repository.
+A group refuses every write by design, and a host that serves files without accepting them answers the same way.
+A `403` to a PUT stays the auth verdict: an account without the write role, or a repository in read-only mode.
 
 Download mirrors the order locally:
 
@@ -332,12 +339,15 @@ The search API walks `/service/rest/v1/search/assets` with continuation tokens.
 It exists on common Nexus 3 releases but is not guaranteed, and on some releases its filters match Maven coordinates rather than raw paths.
 Treat `--ls` output as a hint only.
 
+Each search item carries the path and, when the index holds them, the digest (`checksum.sha256`) and the size (`fileSize`), so a client reads the facts instead of a HEAD per name.
+The size key is `fileSize` on the pinned 3.96.3, never `size`, and the client accepts the flat `size` form only as a fallback for a proxy that rewrites the document.
 A directory listing (`ls`, `ls --assets`, and the `down --ls` enumeration at a version directory) asks the same endpoint with `q=<percent-encoded directory path>/`.
 `q` is a page cutter, never the answer: the server matches it loosely (a case-sensitive path substring, measured against the pinned 3.96.3), so the pages may carry a superset (a copy of the directory under another parent, or a name-continuing sibling when the trailing slash is missing), and the client-side whole-segment prefix filter turns that superset into exactly the directory's names.
 The property that a directory query never drops a name is versioned, not verified at run time: the search answer carries no count to compare against.
 The stand battery pins it against the pinned Nexus image (`stand/real-nexus/battery.sh`): a seeded directory's `q` listing must equal the repository-wide walk restricted to that directory.
 Repository-wide walks (`audit`, `diff --via search`, the `up --wait-index` visibility poll) send no `q`: there the page set has to be the repository, and a filter the audit trusts would be a hole in the audit.
 Every walk is bounded per invocation at 1000 pages of 50 rows (50 000 objects), and a walk that hits the bound refuses with `cannot enumerate`: never a silently truncated listing.
+A row whose path is outside the artifact grammar (a space, a percent-decoded slash) is not an artifact any client can transfer: a walk leaves it out and reports the count as a warning, so the listing is short by name, never by accident.
 
 If your consumers need a machine-readable name list, publish one as an ordinary artifact.
 `nxr` itself does not read it: the list belongs to the pipeline that consumes it.

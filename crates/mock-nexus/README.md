@@ -8,6 +8,10 @@ A behavior pinned against the mock is therefore pinned against a single contract
 The server depends only on the standard library and `serde_json`.
 It handles one request per connection and closes every connection, so there is no keep-alive, no chunked encoding and no async runtime.
 
+Search is served only by the scenarios that model it: `search-lag` (store-backed, one item per stored object) plus the synthetic pages of `assets-pagination`, `assets-prefix-q` and `audit-litter`, and the failure shape of `search-400`.
+Every other scenario answers `/service/rest/v1/search/assets` with 404, so `nxr clone` and the search-driven surfaces refuse with `cannot enumerate` against them.
+To clone a tree you uploaded yourself, run `mock-nexus search-lag --lag-ms 0`.
+
 ## Quick starts
 
 As a library in a Rust test:
@@ -35,6 +39,8 @@ cargo run -p mock-nexus -- atomic --seed-dir ./fixture --config rate-limit.json
 
 The `atomic` scenario is the correct server: PUT, GET, HEAD, `Range` resume, `404` on unknown paths.
 `mock-nexus --print-scenarios` names all of them.
+
+The key is the path as served: a tree meant for a repository URL carries the prefix in the seed directory (`fixture/repository/raw-main/1.0.0/a.bin`), while the same file without it is served at `http://host/1.0.0/a.bin` and stays invisible to `/repository/raw-main/…` requests.
 
 ## Presets and composition
 

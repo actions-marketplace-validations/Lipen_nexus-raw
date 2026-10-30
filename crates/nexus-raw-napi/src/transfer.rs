@@ -62,6 +62,14 @@ pub async fn up(
                     return Err(js_error(e));
                 }
             };
+            // The CLI refuses an empty selection: "resolved with nothing" reads
+            // as "published" to a caller, and the release never landed.
+            if scanned.is_empty() {
+                drop(nxr);
+                return Err(js_error(Error::Misuse(format!(
+                    "nothing to upload: no names under the selected prefixes in {src_dir}"
+                ))));
+            }
             Some(scanned)
         }
         (None, None) => None,
@@ -195,7 +203,8 @@ pub async fn clone(
     let (tx, rx) = mpsc::unbounded_channel();
     let nxr = Nxr::new(cfg, tx).map_err(js_error)?;
     let prefixes = parse_prefixes(o.prefixes)?;
-    let mode = clone_state_mode(o.state.as_deref(), o.no_state.unwrap_or(false));
+    let mode =
+        clone_state_mode(o.state.as_deref(), o.no_state.unwrap_or(false)).map_err(js_error)?;
     let pump = spawn_pump(rx, on_event);
     let summary = nxr
         .clone_to(
@@ -236,7 +245,8 @@ pub async fn clone_plan(
     let (tx, rx) = mpsc::unbounded_channel();
     let nxr = Nxr::new(cfg, tx).map_err(js_error)?;
     let prefixes = parse_prefixes(o.prefixes)?;
-    let mode = clone_state_mode(o.state.as_deref(), o.no_state.unwrap_or(false));
+    let mode =
+        clone_state_mode(o.state.as_deref(), o.no_state.unwrap_or(false)).map_err(js_error)?;
     let pump = spawn_pump(rx, on_event);
     let actions = nxr
         .clone_plan(
@@ -262,14 +272,24 @@ fn parse_prefixes(raw: Option<Vec<String>>) -> Result<Vec<NamePrefix>> {
         .collect()
 }
 
-fn clone_state_mode(state: Option<&str>, no_state: bool) -> StateMode<'_> {
-    if no_state {
+fn clone_state_mode<'a>(
+    state: Option<&'a str>,
+    no_state: bool,
+) -> std::result::Result<StateMode<'a>, nexus_raw_core::Error> {
+    // The CLI makes the two flags a clap conflict: `noState` must not win
+    // silently over an explicit path.
+    if no_state && state.is_some() {
+        return Err(nexus_raw_core::Error::Misuse(
+            "state and noState exclude each other: pass one".to_owned(),
+        ));
+    }
+    Ok(if no_state {
         StateMode::Off
     } else if let Some(path) = state {
         StateMode::At(Path::new(path))
     } else {
         StateMode::Default
-    }
+    })
 }
 
 fn clone_action(action: &CloneAction) -> NxrClonePlanAction {
@@ -564,70 +584,79 @@ mod tests {
         (srv, local)
     }
 
-    #[tokio::test]
-    async fn diff_reports_the_four_states() {
-        let (srv, local) = seed_four_states();
-        let url = format!("{}1.14.0/", srv.base_url());
-        let report = diff(
-            local.path().to_str().unwrap().to_owned(),
-            url,
-            Some(crate::opts::NxrDiffOpts {
-                names: Some(vec![
-                    "a.zip".to_owned(),
-                    "b.zip".to_owned(),
-                    "c.zip".to_owned(),
-                    "d.zip".to_owned(),
-                ]),
-                ..Default::default()
-            }),
-        )
-        .await
-        .expect("the delta report resolves");
-        assert_eq!(report.count, 4, "one entry per name in the union");
-        let shape: Vec<(&str, &str)> = report
-            .entries
-            .iter()
-            .map(|e| (e.path.as_str(), e.state.as_str()))
-            .collect();
-        assert_eq!(
-            shape,
-            [
-                ("a.zip", "same"),
-                ("b.zip", "missing-local"),
-                ("c.zip", "missing-remote"),
-                ("d.zip", "diverged"),
-            ],
-            "one entry per state, in name order"
-        );
-        let alpha_hex = sha256_hex(b"alpha bytes\n");
-        let beta_hex = sha256_hex(b"beta bytes!!\n");
-        // same: the shared digest travels, the side objects stay empty.
-        let same = &report.entries[0];
-        assert_eq!(same.digest.as_deref(), Some(alpha_hex.as_str()));
-        assert!(same.local.is_none() && same.remote.is_none());
-        assert!(same.size.is_none() && same.sha.is_none());
-        // missing-local: only the storage side speaks.
-        let missing_local = &report.entries[1];
-        let remote = missing_local.remote.as_ref().unwrap();
-        assert_eq!(remote.digest.as_deref(), Some(beta_hex.as_str()));
-        assert_eq!(remote.size, Some(13.0));
-        assert!(missing_local.local.is_none() && missing_local.digest.is_none());
-        // missing-remote: only the local side speaks, hashed on the fly.
-        let missing_remote = &report.entries[2];
-        let local_side = missing_remote.local.as_ref().unwrap();
-        assert_eq!(local_side.digest.as_deref(), Some(alpha_hex.as_str()));
-        assert_eq!(local_side.size, Some(12.0));
-        assert!(missing_remote.remote.is_none() && missing_remote.digest.is_none());
-        // diverged: both sides speak, both dimensions provably differ.
-        let diverged = &report.entries[3];
-        assert_eq!(
-            diverged.local.as_ref().unwrap().digest.as_deref(),
-            Some(beta_hex.as_str())
-        );
-        assert_eq!(
-            diverged.remote.as_ref().unwrap().digest.as_deref(),
-            Some(alpha_hex.as_str())
-        );
-        assert!(diverged.size == Some(true) && diverged.sha == Some(true));
+    // The guard must cover the environment for the whole call: `build_config`
+    // reads it on the way in. The test is sync and drives the runtime itself,
+    // so the std guard never crosses an await.
+    #[test]
+    fn diff_reports_the_four_states() {
+        let _env = crate::testenv::ENV_LOCK.lock().expect("env lock");
+        let _clean = crate::testenv::CleanEnv::new();
+        tokio::runtime::Runtime::new()
+            .expect("test runtime")
+            .block_on(async {
+                let (srv, local) = seed_four_states();
+                let url = format!("{}1.14.0/", srv.base_url());
+                let report = diff(
+                    local.path().to_str().unwrap().to_owned(),
+                    url,
+                    Some(crate::opts::NxrDiffOpts {
+                        names: Some(vec![
+                            "a.zip".to_owned(),
+                            "b.zip".to_owned(),
+                            "c.zip".to_owned(),
+                            "d.zip".to_owned(),
+                        ]),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("the delta report resolves");
+                assert_eq!(report.count, 4, "one entry per name in the union");
+                let shape: Vec<(&str, &str)> = report
+                    .entries
+                    .iter()
+                    .map(|e| (e.path.as_str(), e.state.as_str()))
+                    .collect();
+                assert_eq!(
+                    shape,
+                    [
+                        ("a.zip", "same"),
+                        ("b.zip", "missing-local"),
+                        ("c.zip", "missing-remote"),
+                        ("d.zip", "diverged"),
+                    ],
+                    "one entry per state, in name order"
+                );
+                let alpha_hex = sha256_hex(b"alpha bytes\n");
+                let beta_hex = sha256_hex(b"beta bytes!!\n");
+                // same: the shared digest travels, the side objects stay empty.
+                let same = &report.entries[0];
+                assert_eq!(same.digest.as_deref(), Some(alpha_hex.as_str()));
+                assert!(same.local.is_none() && same.remote.is_none());
+                assert!(same.size.is_none() && same.sha.is_none());
+                // missing-local: only the storage side speaks.
+                let missing_local = &report.entries[1];
+                let remote = missing_local.remote.as_ref().unwrap();
+                assert_eq!(remote.digest.as_deref(), Some(beta_hex.as_str()));
+                assert_eq!(remote.size, Some(13.0));
+                assert!(missing_local.local.is_none() && missing_local.digest.is_none());
+                // missing-remote: only the local side speaks, hashed on the fly.
+                let missing_remote = &report.entries[2];
+                let local_side = missing_remote.local.as_ref().unwrap();
+                assert_eq!(local_side.digest.as_deref(), Some(alpha_hex.as_str()));
+                assert_eq!(local_side.size, Some(12.0));
+                assert!(missing_remote.remote.is_none() && missing_remote.digest.is_none());
+                // diverged: both sides speak, both dimensions provably differ.
+                let diverged = &report.entries[3];
+                assert_eq!(
+                    diverged.local.as_ref().unwrap().digest.as_deref(),
+                    Some(beta_hex.as_str())
+                );
+                assert_eq!(
+                    diverged.remote.as_ref().unwrap().digest.as_deref(),
+                    Some(alpha_hex.as_str())
+                );
+                assert!(diverged.size == Some(true) && diverged.sha == Some(true));
+            });
     }
 }

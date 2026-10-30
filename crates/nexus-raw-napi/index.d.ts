@@ -51,7 +51,7 @@ export interface NxrCommonOpts {
  * `removing`/`removed`/`missing` from `rm`, `summary` from everything that moves or deletes bytes.
  */
 export interface NxrEvent {
-  event?: 'plan' | 'artifact' | 'retrying' | 'removing' | 'removed' | 'missing' | 'summary'
+  event?: 'plan' | 'artifact' | 'retrying' | 'removing' | 'removed' | 'missing' | 'warning' | 'summary'
   /** `plan` only: the name lists of the diff. */
   upload?: string[]
   download?: string[]
@@ -67,6 +67,8 @@ export interface NxrEvent {
   /** `retrying` only. */
   attempt?: number
   reason?: string
+  /** `warning` only: rows the run had to leave out, one sentence. */
+  text?: string
   /** `summary` only. */
   uploaded?: number
   downloaded?: number
@@ -105,7 +107,7 @@ export interface NxrSummary {
 export interface NxrPlanAction {
   action: 'skip' | 'upload' | 'download'
   name: string
-  /** Byte size when the action transfers bytes. */
+  /** Byte size when the action transfers bytes. Absent otherwise. */
   size?: number
 }
 
@@ -126,7 +128,7 @@ export interface NxrGetOpts extends NxrCommonOpts {
 export interface NxrGetResult {
   /** Final size in bytes (stdout mode: bytes written). */
   size: number
-  /** The digest when a file was produced (stdout streaming does not hash). */
+  /** The digest when a file was produced (stdout streaming does not hash). Absent otherwise. */
   sha256?: string
   /** The offset the transfer resumed from (0 for a fresh download). */
   resumedFrom: number
@@ -139,12 +141,13 @@ export interface NxrPutOpts extends NxrCommonOpts {
 
 export interface NxrPutResult {
   size: number
-  /** The uploaded digest when the sha-sibling was requested. */
+  /** The uploaded digest when the sha-sibling was requested. Absent otherwise. */
   sha256?: string
 }
 
 export interface NxrHeadResult {
   status: number
+  /** `Content-Length` when the answer carried one. Absent otherwise. */
   size?: number
   contentType?: string
 }
@@ -163,9 +166,9 @@ export interface NxrUpOpts extends NxrCommonOpts {
 }
 
 export interface NxrDownOpts extends NxrCommonOpts {
-  /** Explicit names to download. */
+  /** Explicit names to download. Excludes `ls`. */
   names?: string[]
-  /** Best-effort enumeration through the server search API (`--ls`). */
+  /** Best-effort enumeration through the server search API (`--ls`). Excludes `names`: one source per call. */
   ls?: boolean
   /** Ignore existing part files: every name downloads from zero. */
   fresh?: boolean
@@ -188,23 +191,23 @@ export interface NxrCloneOpts extends NxrCommonOpts {
 export interface NxrClonePlanAction {
   action: 'download' | 'skip' | 'seal'
   name: string
-  /** Byte size when the action knows it. */
+  /** Byte size when the action knows it. Absent otherwise. */
   size?: number
 }
 
 export interface NxrDiffOpts extends NxrCommonOpts {
-  /** Explicit names to compare. */
+  /** Explicit names to compare. Excludes `ls`. */
   names?: string[]
-  /** Best-effort enumeration through the server search API (`--ls`). */
+  /** Best-effort enumeration through the server search API (`--ls`). Excludes `names`: one source per call. */
   ls?: boolean
   /** Keep only names under these whole-segment prefixes. */
   prefixes?: string[]
 }
 
 export interface NxrRmOpts extends NxrCommonOpts {
-  /** Explicit names to delete. */
+  /** Explicit names to delete. Excludes `ls`. */
   names?: string[]
-  /** Best-effort enumeration through the server search API (`--ls`). */
+  /** Best-effort enumeration through the server search API (`--ls`). Excludes `names`: one source per call, so a destructive call never widens. */
   ls?: boolean
   /** Delete for real. Without it the promise resolves to the plan (`rm --yes`). */
   confirm?: boolean
@@ -215,7 +218,7 @@ export interface NxrRmPlanAction {
   /** `rm` when the remote copy exists and would be deleted, `missing` when it is already absent. */
   action: 'rm' | 'missing'
   name: string
-  /** Byte size when the remote copy exists. */
+  /** Byte size when the remote copy exists. Absent otherwise. */
   size?: number
 }
 
@@ -224,12 +227,12 @@ export interface NxrRmPlan {
   actions: NxrRmPlanAction[]
 }
 
-/** The content facts one side holds for a name. `null` means the fact is unknown, never that it differs. */
+/** The content facts one side holds for a name. An absent field means the fact is unknown, never that it differs. */
 export interface NxrDeltaSide {
   /** The sha256 digest, when the side carries one. */
-  digest: string | null
+  digest?: string
   /** Byte size, when the side reports one. */
-  size: number | null
+  size?: number
 }
 
 /** One delta entry, shaped like the CLI `diff --json` lines. */
@@ -237,15 +240,15 @@ export interface NxrDeltaEntry {
   /** `same`, `missing-local`, `missing-remote` or `diverged`. */
   state: 'same' | 'missing-local' | 'missing-remote' | 'diverged'
   path: string
-  /** The shared digest when the state is `same`. */
+  /** The shared digest when the state is `same`. Absent otherwise. */
   digest?: string
   /** The local-side facts when the state is `missing-remote` or `diverged`. */
   local?: NxrDeltaSide
   /** The storage-side facts when the state is `missing-local` or `diverged`. */
   remote?: NxrDeltaSide
-  /** The sizes are known on both sides and differ, `diverged` only. */
+  /** The sizes are known on both sides and differ, `diverged` only. Absent otherwise. */
   size?: boolean
-  /** The digests are known on both sides and differ, `diverged` only. */
+  /** The digests are known on both sides and differ, `diverged` only. Absent otherwise. */
   sha?: boolean
 }
 
@@ -264,9 +267,9 @@ export interface NxrMirrorOpts extends NxrCommonOpts {
   srcAuth?: NxrAuth
   /** Explicit credentials for the destination. They win over `auth` and the environment fallback. */
   dstAuth?: NxrAuth
-  /** Explicit names to copy. */
+  /** Explicit names to copy. Excludes `ls`. */
   names?: string[]
-  /** Best-effort enumeration through the server search API (`--ls`). */
+  /** Best-effort enumeration through the server search API (`--ls`). Excludes `names`: one source per call. */
   ls?: boolean
 }
 
@@ -283,9 +286,9 @@ export interface NxrVerifyOpts extends NxrCommonOpts {
 export interface NxrChannelSetResult {
   /** False when the forward-only guard kept the current token. */
   written: boolean
-  /** The previous token, when one was readable. */
+  /** The previous token when one was readable. Absent otherwise. */
   from?: string
-  /** The kept token, when the write was skipped. */
+  /** The kept token when the write was skipped. Absent otherwise. */
   current?: string
 }
 
@@ -416,6 +419,10 @@ export interface NxrLsEntry {
   name: string
   /** `"dir"` when the child has a subtree below it, `"file"` when it is a leaf. */
   kind: string
+  /** The artifact's size in bytes, when the search answer carried it. Absent for folders and unknown facts. */
+  size?: number
+  /** The artifact's sha256, when the search answer carried it. Absent for folders and unknown facts. */
+  sha256?: string
 }
 
 /** The immediate children of a raw directory URL, at any tree depth: folders first, then files. */

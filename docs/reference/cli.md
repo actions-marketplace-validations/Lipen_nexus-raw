@@ -87,7 +87,7 @@ With `-o` the bytes stream into `<FILE>.part`, which is renamed to `FILE` only a
 | Flag | Meaning |
 |:-----|:--------|
 | `-o, --out <FILE>` | output file. stdout when omitted |
-| `--continue` | resume from an existing `<FILE>.part` through a `Range: bytes=N-` request |
+| `--continue` | resume from an existing `<FILE>.part` through a `Range: bytes=N-` request. The assembled bytes are hashed against the local or server-side `.sha256` sibling before the rename, and a divergence is refused (exit 1) with the part removed |
 | `--segments <N>` | fetch through `N` concurrent byte-range requests (2 to 64). File output only: a stdout target is a misuse (exit 2). `--continue` and `--segments` exclude each other |
 | `--range <RANGE>` | one byte span, `START-END` or `START-`, where `START-` reads to the end. The span goes to `-o` or stdout. Conflicts with `--continue` and `--segments` |
 
@@ -111,6 +111,8 @@ get: 45 bytes → app.zip (resumed from 20)
 $ echo $?
 0
 ```
+
+The resumed content is not trusted blindly: `--continue` hashes the assembled bytes and compares them with the `.sha256` sibling, so a stale part from a different object is refused with a `mismatch` instead of being renamed, and the part is removed so a rerun starts clean.
 
 `--segments 4` fetches the object through 4 concurrent byte-range requests.
 The HEAD gives the size, the spans stream into a staging area beside the output, the assembled file verifies against the `.sha256` sibling when one exists and is renamed only when whole.
@@ -177,7 +179,7 @@ $ echo $?
 | Exit | When |
 |:----:|:-----|
 | `0` | bytes (and marker, when asked) stored |
-| `1` | local I/O: the input file is missing or unreadable |
+| `1` | local I/O: the input file is missing or unreadable, or the write refused (405: a group repository, or a host without PUT) |
 | `2` | misuse: a non-http URL |
 | `3` | auth failure, 5xx after retries, unexpected status |
 
@@ -262,7 +264,7 @@ Repeated names transfer again, identical ones are skipped, and an interrupted `u
 | Flag | Meaning |
 |:-----|:--------|
 | `--no-sha` | skip marker generation and marker uploads, bytes only |
-| `--if-changed` | skip names whose remote marker digest equals the local copy, re-upload the changed rest (a missing or foreign remote marker re-uploads the name) |
+| `--if-changed` | skip names whose remote marker digest equals the local copy, re-upload the changed rest (a missing or wrong-digest remote marker re-uploads the name, and an unparseable remote marker still refuses, like the plain `up`) |
 | `--plan` | print the plan without transferring anything (the `--dry-run` spelling works as an alias) |
 | `--prefix <PREFIX>` | publish only the names under this whole-segment prefix (`bom/`), repeatable. The relative path is kept, so `a/x` lands as `a/x`. The selected subtrees are scanned. Entries outside them are never read |
 | `--claim-first <NAME>` | upload this one name first and alone, before any other name starts |
@@ -345,7 +347,7 @@ $ echo $?
 | Exit | When |
 |:----:|:-----|
 | `0` | plan executed, remote converged |
-| `1` | data refusal: `mismatch`, `incomplete`. local I/O failures |
+| `1` | data refusal: `mismatch`, `incomplete`, or the write refused (405: a group repository, or a host without PUT). local I/O failures |
 | `2` | misuse: not a directory, empty directory, unsafe name, a symlink or other non-regular entry, an empty `--prefix` selection, a `--claim-first` name outside the directory or the prefixes |
 | `3` | transport or auth failure: the `failed:` list names what did not land |
 
@@ -486,7 +488,7 @@ $ echo $?
 0
 ```
 
-The `--json` plan lines carry `{"plan":"download|skip|seal","name":…}`. The summary gains `"sealed"`, the count of markers written without a transfer.
+The `--json` lines of `--plan` are `{"name":…,"plan":"download","size":…}` for a transfer and `{"name":…,"plan":"skip"|"seal"}` otherwise, and a real run's plan event is the transfer projection (`download`/`skip`/`upload`), where a sealed name rides `skip`. The summary gains `"sealed"`, the count of markers written without a transfer.
 
 | Exit | When |
 |:----:|:-----|
@@ -504,6 +506,7 @@ nxr diff <LOCAL_DIR> <SRC_URL> [--name NAME]... [--names-from FILE]... [--ls] [-
 Compare a local directory against a remote one and print the delta, changing nothing on either side.
 The enumeration is the one `down` uses: repeatable `--name` or best-effort `--ls`.
 The name set is the union of the local scan and the enumeration, so a local-only name shows up as `missing-remote` even when the enumeration is restricted.
+`--prefix` is the exception: it narrows the whole report, the local-only rows included, so a local name outside the selected prefixes never appears.
 
 | Section | Meaning |
 |:--------|:--------|
@@ -607,7 +610,7 @@ The staging directory carries a lock: a second concurrent `mirror` for the same 
 | Exit | When |
 |:----:|:-----|
 | `0` | plan executed, the destination holds every enumerated name |
-| `1` | data refusal: `cannot enumerate`, a diverging complete copy at the destination (`mismatch`). local I/O around the staging directory |
+| `1` | data refusal: `cannot enumerate`, a diverging complete copy at the destination (`mismatch`), the destination refusing the write (405: a group repository). local I/O around the staging directory |
 | `2` | misuse: an unsafe `--name`, a second `mirror` already running for this pair |
 | `3` | transport or auth failure, on either side |
 
@@ -671,7 +674,7 @@ $ nxr rm https://nexus.example.com/repository/raw-main/1.14.0/ --ls --yes
 uploaded 0, downloaded 0, skipped 0
 failed: a.zip
 error: read-only: https://nexus.example.com/repository/raw-main/1.14.0/a.zip.sha256: HTTP 403
-hint: the repository answered 403 to DELETE: it is read-only or the credentials lack write access, so rerunning is safe and nothing was removed
+hint: the repository answered 403 to a write: a group repository is read-only (target a hosted member), and a hosted one needs the write role; that write changed nothing, so rerunning is safe
 $ echo $?
 1
 ```
@@ -734,7 +737,7 @@ rm a.zip
 | Exit | When |
 |:----:|:-----|
 | `0` | the pour converged and the delete finished, or the plans printed without `--yes` |
-| `1` | data refusal: `cannot enumerate`, the delete phase refused on a read-only source |
+| `1` | data refusal: `cannot enumerate`, a refused write in either phase (405 to a group, 403/405 to a delete) |
 | `2` | misuse: a bad URL, name or prefix |
 | `3` | transport or auth failure of either phase |
 
@@ -792,6 +795,7 @@ Leaf `.sha256` siblings are hidden: they are derived data the protocol generates
 The enumeration runs through the server search API (`/service/rest/v1/search/assets`), so a subtree the server has not indexed is invisible to `ls` even though its bytes are there.
 Probe availability by name with `head` or `get` instead.
 When the enumerator hides markers, `ls` names the count in a trailing line (`N marker objects hidden`), so a short listing is a fact, not a surprise.
+`--assets` names a different shortfall the same way: a name the server holds outside the artifact grammar cannot be transferred by the protocol, so it is left out and the count is reported (`N name(s) outside the artifact grammar hidden`).
 
 | Flag | Meaning |
 |:-----|:--------|
@@ -829,8 +833,13 @@ Treat both as conveniences only.
 | `2` | misuse: a non-http URL, or a URL outside `/repository/<name>/...` |
 | `3` | transport or auth failure |
 
-`--json` prints one object per line: `{"entry":"app","kind":"dir"}` and `{"entry":"release-notes.txt","kind":"file"}` from the tree, `{"name":"app.zip"}` from `--assets`.
-When the tree enumeration hides `.sha256` markers as derived data, a final line reports the count: `{"event":"hidden","count":1}`.
+`--json` prints one object per line: `{"entry":"app","kind":"dir"}` and `{"entry":"release-notes.txt","kind":"file","size":45,"sha256":"a8a2…"}` from the tree, `{"name":"app.zip"}` from `--assets`.
+A file row carries the size and sha256 the search answer reported, when it did, so a consumer can plan without a HEAD per name.
+A folder row carries neither: a raw folder has no size of its own.
+An index or proxy that reports no facts leaves the fields out rather than inventing them.
+The count is the hidden rows of the listed directory, not of the whole subtree below it.
+
+When the enumeration hides rows as derived data or as untransferable, a final line reports the count with its reason: `{"event":"hidden","count":1,"reason":"marker"}` from the tree, `{"event":"hidden","count":1,"reason":"grammar"}` from `--assets`.
 
 ## nxr channel get
 
@@ -930,6 +939,13 @@ error: incomplete: pinned.xml
 hint: rerun the same command: finished names are skipped and the rest is retried
 $ echo $?
 1
+```
+
+`--json` prints the `summary` event, where `skipped` counts the complete names (a broken name lowers it) and `failed`/`failures` list the rest, then one `error` object carrying the incomplete hint:
+
+```json
+{"downloaded":0,"event":"summary","failed":["a.bin"],"failures":[{"code":1,"name":"a.bin"}],"kind":"transfer","removed":0,"sealed":0,"skipped":0,"uploaded":0}
+{"code":1,"error":"incomplete: a.bin","event":"error","hint":"rerun the same command: finished names are skipped and the rest is retried"}
 ```
 
 | Exit | When |
@@ -1051,6 +1067,8 @@ raw-main raw hosted https://nexus.example.com/repository/raw-main
 The collection is the one your credentials see: a repository hidden from your account resolves as a data error, never guessed.
 The collection itself is trimmed on 3.79 (`size`, empty `attributes` even for an admin): that is everything the endpoint gives without admin rights.
 
+`--json` prints one object: the entry (`name`, `format`, `type`, `url`), and under `--detail` the settings document under the same object's `detail` key.
+
 `--detail` additionally fetches the full settings through the admin-only single-repository endpoint:
 
 ```console
@@ -1137,7 +1155,7 @@ Missing credentials are a warning, not a failure: the run reports `none found` a
 
 | Flag | Meaning |
 |:-----|:--------|
-| `--deep` | add read-only probes of the server itself: auth, range, content-length, search, repo-type, tls, version |
+| `--deep` | add read-only probes of the server itself: version, content-length, range, search, repo-type, eula |
 | `--probe-name <NAME>` | the object the targeted probes (range, content-length) examine. Without it, one is found by a single listing of the repository root |
 
 `--deep` requires a URL: without one it is misuse (exit 2), because every deep probe talks to a server.
@@ -1164,21 +1182,23 @@ $ echo $?
 3
 ```
 
-With `--deep` the report grows one line per server probe, and warns still exit 0:
+With `--deep` the report grows one line per server probe, each named `deep:…`, and warns still exit 0:
 
 ```console
-$ env NXR_AUTH=Y2ktYm90OnRva2Vu nxr doctor https://nexus.example.com/repository/raw-main/ --deep
+$ env NXR_AUTH=Y2ktYm90OnRva2Vu nxr doctor https://nexus.example.com/repository/raw-main/1.4.0/ --deep
 doctor:
   [  ok  ] credentials: resolved from NXR_AUTH
   [  ok  ] tls: verification is ON
   [  ok  ] settings: workers 8, retry 4, stall 30s, connect 15s
-  [  ok  ] auth: repository answers your credentials
-  [ WARN ] range: range-stripped: a ranged GET answered 200 with the whole body, --segments degrades to single-stream
-  [  ok  ] content-length: present (45 bytes)
-  [ WARN ] search: search-dead: HTTP 400, diff --via search refuses here, --fallback degrades explicitly
-  [  ok  ] repo-type: hosted
-  [  ok  ] version: 3.84.0-01
-  2 warning(s), all checks passed
+  [  ok  ] proxy: no proxy in the environment
+  [  ok  ] probe: status endpoint answered: the server is reachable
+  [  ok  ] deep:version: status endpoint answered
+  [  ok  ] deep:content-length: present (45)
+  [ warn ] deep:range: warning: range-stripped (200 to a ranged GET: --segments degrades to the single stream)
+  [ warn ] deep:search: warning: search-dead (400: the repository is unknown to the index; diff --via search refuses there, --fallback saves it)
+  [  ok  ] deep:repo-type: hosted, format raw
+  [  ok  ] deep:eula: accepted (writes are not gated)
+  all checks passed with 2 warning(s)
 $ echo $?
 0
 ```
@@ -1232,7 +1252,7 @@ An unknown shell is misuse: exit 2, the message names the four supported shells,
 ## Output
 
 Human output goes to stdout.
-`error:` and `hint:` lines go to stderr.
+`error:`, `hint:` and `warning:` lines go to stderr.
 The line vocabulary:
 
 - `plan: N to upload, N to download, N up to date`, once per transfer.
@@ -1244,6 +1264,7 @@ The line vocabulary:
 - `failed: name, name` after the summary, when names did not land.
 
 `-q` keeps the summary line and the failure lines, and drops the per-name progress and the plan.
+A `warning:` line is not chatter: it names rows the run had to leave out, so it survives `-q` with the failures.
 `-v` adds plan names and transfer starts, each with the size in human units (`↓ app.zip 24 B`, `↑ log.txt 1.2 KiB`).
 
 Colors are terminal-only.
@@ -1272,7 +1293,8 @@ Artifact lines arrive in worker completion order, not plan order.
 
 `--json` switches stdout to NDJSON:
 
-- `up`, `down`, `mirror`, `rm`, `verify`, `get -o` and `put` print the event stream (`plan`, `artifact`, `removing`/`removed`/`missing`, `retrying`, `summary`).
+- `up`, `down`, `mirror`, `rm`, `verify`, `get -o` and `put` print the event stream (`plan`, `artifact`, `removing`/`removed`/`missing`, `retrying`, `warning`, `summary`).
+  A `warning` event carries `{"event":"warning","text":"<one sentence>"}` and says what the run left out, for example a search listing entry outside the artifact grammar that no transfer can carry.
   Every `summary` carries `"kind"`: `"transfer"` for the streams above, `"audit"` for `nxr audit`, which reports its own counts under the same `event` name.
   A transfer `summary` also carries `"failures"`: a list of `{"code","name"}` objects for the same artifacts as `failed`, in the same order, where `code` is the exit-code class (1 data, 2 misuse, 3 transport).
   `failed` keeps its legacy strings, so a digest mismatch there still reads `name: detail`, while `failures` always carries the bare name.

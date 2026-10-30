@@ -5,7 +5,66 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `nxr ls` carries the search facts it already fetched: a file row in `--json` gains `size` and `sha256` when the index reports them, and `Nxr::ls_entries` / the Node `lsEntries` expose the same fields.
+  A consumer plans a selective download without a HEAD per name, and a folder row carries neither (a raw folder has no size of its own).
+- The browser's file card takes the size and digest the listing carried: they show at once, and the HEAD and the `.sha256` GET run only for a fact the listing lacks.
+- The `mock-nexus` binary takes `--lag-ms N`: the `search-lag` catch-up window is configurable (6000 ms unless named), so a listing right after a write no longer needs a wait.
+- A `static-host` mock scenario pins the bare file-server profile: reads and ranges work, every write is the read-only refusal (405, exit 1), and the whole service plane answers 404, the search API included.
+  The core, the CLI and the Python client test it, so the read profile off Nexus stops being a manual nginx probe.
+- A `warning` event, rendered as a `warning:` line on stderr and as `{"event":"warning","text":...}` under `--json`, names the rows an enumeration left out because they are outside the artifact grammar: `down --ls`, `clone`, `diff --via search` and the list command share it, so a transfer no longer loses such a name silently.
+  The Node bindings surface the same event, and the skill carries the exit-code rule.
+
+### Security
+
+- `nxr-tui` downloads keep every server-chosen name inside the destination.
+  A repository row survives only on the session origin and with a name that is one safe directory segment, so `--smoke` no longer deletes `{root}/{hostile name}` and a whole-repository download no longer lands in an absolute path.
+  A listing name that fails the artifact grammar (a percent-encoded `/` decodes into one) is refused before a transfer instead of being joined onto the destination.
+- The TUI origin check parses both URLs through the core's `normalize_base`, so a repository URL carrying userinfo, a query or a fragment shares no origin, and a refresh filters exactly like the first load.
+  The status line, the error modal and the smoke output print `scheme://host[:port]`, never a URL with a password in it.
+- `nxr-mount` normalizes the URL before the shape check and before any message can echo it: a `user:pass@` or a `?token=` URL is refused by the normalization, which never repeats the value, and the mount name is the normalized URL.
+- The browser's single-file download refuses a symlinked directory on the way to the target, the same `ensure_symlink_free` rule the directory transfer applies, so a planted `dst/app -> ~/.config` receives neither the artifact nor its marker.
+
+### Fixed
+
+- A stray `.part` in a scanned tree names its repair: the reserved-suffix refusal says the file is staging from an interrupted transfer and to finish or delete it, instead of the bare suffix rule.
+- `nxr doctor --deep` names a missing service plane instead of calling an absent endpoint empty: the status, repositories and eula probes read `absent (404)`, the search probe reads `search-dead (404: the search endpoint is absent; …)`, and a deep warning carries the `[ warn ]` marker, the `"warn":true` field and the summary count like every other warning.
+  A search endpoint that answers 400 (the repository is unknown to the index) is the `search-dead` warning too, so doctor exits 0 on advice it can give and never fails a run over a listing that cannot work.
+- The `search-lag` mock serves the digest of the stored marker, so `diff --via search` against the mock compares real facts: the page used to print zeros, so every uploaded name reported as `diverged (sha)` and the audit flagged every asset as `diverged_fact`.
+  A marker row reports no digest instead of a placeholder.
+- The search facts the client reads carry a size on a real Nexus: the pinned 3.96.3 serves the field as `fileSize`, and `diff --via search`, `service assets` and the new `ls --json` size read `size`, which no real answer carries, so the size was always absent.
+  The flat `size` form stays as a fallback for a proxy that rewrites the document.
+- A single-file download in `nxr-tui` writes the `.sha256` marker it computed, so a tree the browser filled passes `nxr verify` offline, exactly like a `down` tree.
+  The marker of the previous download is dropped before the next transfer: left in place it became the resume guard's expectation and refused a legitimately changed object.
+- The browser's card download builds its URL from the repository root and the name's own path: a card opened on a row inside an expanded folder used to fetch the tab root plus the bare name, a different object.
+- The browser's single-file download accepts a folder name with a space or unicode while still refusing a segment with a decoded `/`, `..` or a control byte.
+- The TUI smoke names an empty repository listing by its cause, an empty repository or a search index still catching up, instead of the download's `no files under ""`.
+- A repository name ending in a dot or a space, or made only of them, is refused by the browser's name rule: on Windows such a name resolves to a different directory.
+  The save-as dialog applies the same rule to a typed folder name.
+  The marker write is one core helper (`sibling::write_marker`) now, shared with `down` and the clone seal.
+- A locally broken bytes/marker pair names its repair: the error says to delete the stale sibling, which the next scan regenerates, or to restore the bytes. The old hint pointed at "two sides" for a disagreement that is purely local.
+- `clone` creates a missing destination the way `down` does, instead of failing with an I/O error named after a part file under a directory that does not exist.
+- `nxr-mount` refuses a URL outside `/repository/<name>/…` at startup with exit 2 and the listing's own message, instead of mounting a tree whose listings can never resolve.
+  The check runs before any request, so a wrong URL costs nothing.
+- The `--ls` and `ls --assets` URL-shape refusal names the alternative: a host without the search API takes `--name` or `--names-from`, and the message says so instead of leaving the user with a Nexus path rule.
+- The Node bindings refuse what the CLI refuses, instead of picking silently:
+  `ls` together with `names` is misuse (it used to drop the names, so `rm` with both deleted the whole listing), `up` with a prefix selection that holds no artifacts is misuse (it used to resolve an empty summary), and `get` with `cont` and no `out` is misuse (it used to ignore the resume).
+  `sha` on an unreadable local file is an I/O refusal (exit 1) like the CLI, not misuse, and `clone` rejects `state` next to `noState` instead of letting one win.
+- A `diff` with `prefixes` filters the whole report in the core, so a local-only name outside the prefixes no longer reports as `missing-remote`.
+  The CLI and the Node bindings share the rule, and the CLI's own filter is gone.
+- A byte body staged by the Node `put` carries the artifact's own name, so its progress events name the upload instead of a temp file.
+- The Node result types mark an unknown fact as optional (`sha256?`, `contentType?`, `size?`, `from?`, `digest?`, the delta sides): the bridge omits a `None` instead of sending `null`, and the delta-side docs claimed `null` before.
+  The Node `diff` examples in the README and the quickstart pass the enumeration source the call needs.
+- The Python reference client classifies a 405 to a PUT as `ReadOnlyError` (exit 1, the hint names the group repository), matching the core, and exports the class in `__all__` like every other documented error.
+- `ls --assets` names the names it leaves out: a server can hold a row outside the artifact grammar (a space, a percent-decoded slash), which the protocol cannot transfer, so the listing reports the count instead of dropping it silently.
+  The `hidden` NDJSON event now carries a `reason` (`marker` from the tree listing, `grammar` from `--assets`).
+- The mount leaves a listing name that is not one path component (a decoded `/`, a nul byte, a dot segment) out of `readdir`: `lookup` refuses such a name, so the row could never open.
+- The HEAD that opens a segmented `down` or `get` is a transfer request: a 5xx or 429 on it retries (and honors `Retry-After`), and a 401/403 takes the auth verdict, exactly like the range GETs that follow.
+  `nxr head` keeps reporting any status: its HEAD is a result, not a failure.
+- A `405` to a PUT is the read-only refusal, the class a `DELETE` already had: exit `1`, never retried, and the hint names the group repository instead of asking the user to retry or to check their credentials.
+  A group repository refuses every write by design, and a host without PUT support answers the same way.
+  `Error::ReadOnly` stays the same variant, its hint is now method-neutral and names the host case too.
 
 ## [0.24.1] - 2026-10-29
 
