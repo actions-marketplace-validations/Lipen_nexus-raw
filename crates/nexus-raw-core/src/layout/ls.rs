@@ -163,19 +163,57 @@ pub async fn search_assets_counted(
     client: &NexusClient,
     dir_url: &str,
 ) -> Result<(Vec<ArtifactName>, usize), Error> {
+    let (entries, skipped) = search_asset_entries(client, dir_url).await?;
+    Ok((
+        entries.into_iter().map(|(name, ..)| name).collect(),
+        skipped,
+    ))
+}
+
+/// The same listing as [`search_assets`], carrying the search-reported facts
+/// per name: the digest and size the server's index holds, so a script that
+/// plans a selective transfer reads them from one listing instead of a HEAD per
+/// name.
+///
+/// A fact the index does not report stays `None`, never a placeholder.
+/// Two paths that decode into one name carry no facts at all: the survivor's
+/// provenance is unknown, and a fact attached to the wrong object would be
+/// worse than its absence.
+///
+/// The second element is how many names the walk left out because they are
+/// outside the artifact grammar, the same count [`search_assets_counted`]
+/// reports.
+///
+/// # Errors
+///
+/// The same as [`search_assets`].
+pub async fn search_asset_entries(
+    client: &NexusClient,
+    dir_url: &str,
+) -> Result<(Vec<(ArtifactName, Option<Digest>, Option<u64>)>, usize), Error> {
     let parts = split_base(dir_url)?;
     let scope = directory_scope(&parts.group, &parts.version);
-    let paths = paginate(client, dir_url, &parts.repo, scope.as_deref()).await?;
-    let mut names = Vec::new();
+    let assets = walk(client, dir_url, &parts.repo, scope.as_deref()).await?;
+    let mut out = Vec::new();
     let mut skipped = 0usize;
-    for path in paths {
-        let rel = drop_segments(&path, parts.group.len());
-        let Some(rel) = rel.strip_prefix(&format!("{}/", parts.version)) else {
-            continue;
-        };
-        if rel.is_empty() {
+    for asset in assets {
+        // A served path is percent-encoded: the entry listing decodes every
+        // segment before it decides what a name is, and the flat listing answers
+        // the same question, so it decodes too.
+        let segs: Vec<String> = asset
+            .path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(percent_decode)
+            .collect();
+        if segs.len() <= parts.group.len() || segs[..parts.group.len()] != parts.group[..] {
             continue;
         }
+        let rest = &segs[parts.group.len()..];
+        if rest.len() < 2 || rest[0] != parts.version {
+            continue;
+        }
+        let rel = rest[1..].join("/");
         // The search sees markers too: they are derived data, hidden by design
         // like the tree listing hides them, so they are not counted as skipped.
         if rel.ends_with(".sha256") {
@@ -183,15 +221,36 @@ pub async fn search_assets_counted(
         }
         // Any other name outside the grammar cannot be transferred: skip it and
         // let the caller name the count.
-        let Ok(name) = ArtifactName::parse(rel) else {
+        let Ok(name) = ArtifactName::parse(&rel) else {
             skipped += 1;
             continue;
         };
-        names.push(name);
+        out.push((name, asset.sha256, asset.size));
     }
-    names.sort();
-    names.dedup();
-    Ok((names, skipped))
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut entries: Vec<(ArtifactName, Option<Digest>, Option<u64>)> =
+        Vec::with_capacity(out.len());
+    let mut i = 0;
+    while i < out.len() {
+        let mut j = i + 1;
+        while j < out.len() && out[j].0 == out[i].0 {
+            j += 1;
+        }
+        // Two served paths can decode into one name (a raw `a-b.zip` and an
+        // `a%2Db.zip`). Rows that agree describe the same object and keep the
+        // fact; rows that disagree give the name no trustworthy fact at all, so
+        // it carries none rather than one object's size under another's name.
+        let agree = out[i..j]
+            .iter()
+            .all(|e| e.1.as_ref() == out[i].1.as_ref() && e.2 == out[i].2);
+        if agree {
+            entries.push((out[i].0.clone(), out[i].1.clone(), out[i].2));
+        } else {
+            entries.push((out[i].0.clone(), None, None));
+        }
+        i = j;
+    }
+    Ok((entries, skipped))
 }
 
 /// Every artifact name under a repository prefix, with the search-reported

@@ -836,8 +836,10 @@ Treat both as conveniences only.
 | `2` | misuse: a non-http URL, or a URL outside `/repository/<name>/...` |
 | `3` | transport or auth failure |
 
-`--json` prints one object per line: `{"entry":"app","kind":"dir"}` and `{"entry":"release-notes.txt","kind":"file","size":45,"sha256":"a8a2…"}` from the tree, `{"name":"app.zip"}` from `--assets`.
+`--json` prints one object per line: `{"entry":"app","kind":"dir"}` and `{"entry":"release-notes.txt","kind":"file","size":45,"sha256":"a8a2…"}` from the tree, `{"name":"app.zip","sha256":"a8a2…","size":45}` from `--assets`.
 A file row carries the size and sha256 the search answer reported, when it did, so a consumer can plan without a HEAD per name.
+A flat `--assets` row carries the same facts, so a script that selects by size or compares against its own index reads one listing.
+Both forms decode a percent-encoded path before the name grammar decides, and two spellings that decode into one name carry no facts when their size or digest disagree.
 A folder row carries neither: a raw folder has no size of its own.
 An index or proxy that reports no facts leaves the fields out rather than inventing them.
 The count is the hidden rows of the listed directory, not of the whole subtree below it.
@@ -1211,8 +1213,12 @@ The report prints one line per check.
 `--json` replaces the human report with one object per check on stdout, plus one `probe` object per server probe under `--deep`:
 
 ```json
-{"check":"credentials","detail":"resolved from NXR_AUTH","ok":true}
+{"check":"credentials","code":"ok","detail":"resolved from NXR_AUTH","ok":true}
 ```
+
+`code` is the verdict class, stable for scripts: a CI job gates on it instead of matching the prose in `detail`.
+The classes are `ok`, `failed`, `skipped`, `anonymous`, `insecure`, `plaintext`, `auth-rejected`, `absent`, `search-dead`, `range-stripped`, `content-length-absent` and `eula-not-accepted`.
+A deep warn keeps both: `{"check":"deep:search","code":"search-dead","detail":"warning: search-dead (400: …)","ok":true,"warn":true}`.
 
 | Exit | When |
 |:----:|:-----|
