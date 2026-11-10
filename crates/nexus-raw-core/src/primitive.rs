@@ -70,18 +70,10 @@ pub async fn get(
     url: &str,
     out: Option<PathBuf>,
     cont: bool,
+    no_sha: bool,
 ) -> Result<GetOutcome, Error> {
     if let Some(out) = out {
         let part = part_of(&out);
-        let resumed_from = if cont {
-            tokio::fs::symlink_metadata(&part)
-                .await
-                .ok()
-                .filter(std::fs::Metadata::is_file)
-                .map_or(0, |m| m.len())
-        } else {
-            0
-        };
         let name = out
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -94,7 +86,7 @@ pub async fn get(
         // `cont`, not `resumed_from > 0`: an attempt that cut mid-body creates
         // the part, and the retry inside this call must resume it. The client
         // refuses a symlink at the path on its own.
-        let (size, digest) = client
+        let (resumed_from, size, digest) = client
             .download_resumable((&name, Dir::Down), url, &part, cont, None)
             .await?;
         // A `--continue` run may have composed a prefix with a tail across
@@ -103,32 +95,13 @@ pub async fn get(
         // before the call. When a `.sha256` sibling exists (locally or on the
         // server), the finished file is checked against it before the rename,
         // and a divergence is a data error (exit 1), not a warning.
-        if cont {
-            let mut sibling = out.clone().into_os_string();
-            sibling.push(".sha256");
-            let expected = if tokio::fs::try_exists(&sibling).await.unwrap_or(false) {
-                tokio::fs::read_to_string(&sibling)
-                    .await
-                    .ok()
-                    .and_then(|t| digest_hex(&t))
-            } else {
-                let remote = format!("{url}.sha256");
-                match client.get_small(&remote).await {
-                    Ok(Some(bytes)) => String::from_utf8(bytes).ok().and_then(|t| digest_hex(&t)),
-                    _ => None,
-                }
-            };
-            if let Some(expected) = expected {
-                if digest != expected {
-                    tokio::fs::remove_file(&part).await.ok();
-                    return Err(Error::Mismatch {
-                        name: out.display().to_string(),
-                        detail: format!(
-                            "resumed content diverges: the .sha256 sibling says {expected}, the bytes hash {digest}"
-                        ),
-                    });
-                }
-            }
+        // A marker that does not parse is a refusal as well: an unreadable
+        // digest verifies nothing, so skipping the check would bless the bytes.
+        // Every complete object written to a file is verified, a plain fetch and a
+        // resume alike; `--no-sha` is the opt-out, and a missing sibling skips the check.
+        if !no_sha {
+            let what = if cont { "resumed" } else { "fetched" };
+            verify_sibling(client, url, &out, &part, &digest, what).await?;
         }
         tokio::fs::rename(&part, &out)
             .await
@@ -243,6 +216,9 @@ pub async fn sibling_digest(client: &NexusClient, url: &str) -> Result<Option<Di
         name: url.to_owned(),
         detail: format!("the .sha256 marker does not parse: {reason}"),
     })?;
+    if parsed.name.is_none() {
+        client.events().bare_sibling();
+    }
     Ok(Some(parsed.digest))
 }
 
@@ -297,6 +273,7 @@ pub async fn get_segmented(
     out: &Path,
     segments: usize,
     events: &crate::events::Progress,
+    no_sha: bool,
 ) -> Result<GetOutcome, Error> {
     // The ceiling lives where the fan-out is built: the facade and external
     // callers of this primitive share one bound.
@@ -331,7 +308,9 @@ pub async fn get_segmented(
             .map_err(|e| Error::io(&part, e))?;
         empty.flush().await.map_err(|e| Error::io(&part, e))?;
         let digest = crate::model::digest::sha256_file(&part).map_err(|e| Error::io(&part, e))?;
-        verify_sibling(client, url, out, &part, &digest).await?;
+        if !no_sha {
+            verify_sibling(client, url, out, &part, &digest, "segmented").await?;
+        }
         tokio::fs::rename(&part, out)
             .await
             .map_err(|e| Error::io(out, e))?;
@@ -414,7 +393,9 @@ pub async fn get_segmented(
     assemble(&bounds, &staging, &part, total).await?;
     // One read pass over the assembled file: the digest, then the sibling verdict.
     let digest = crate::model::digest::sha256_file(&part).map_err(|e| Error::io(&part, e))?;
-    verify_sibling(client, url, out, &part, &digest).await?;
+    if !no_sha {
+        verify_sibling(client, url, out, &part, &digest, "segmented").await?;
+    }
     tokio::fs::rename(&part, out)
         .await
         .map_err(|e| Error::io(out, e))?;
@@ -468,9 +449,19 @@ pub(crate) async fn assemble(
     Ok(())
 }
 
-/// The completion digest check of the segmented path: a local `.sha256` sibling wins,
+/// The completion digest check of both file paths: a local `.sha256` sibling wins,
 /// the remote one answers when the local is absent, and a divergence is a data error
 /// (exit 1) that also removes the part, so nothing partial is ever renamed.
+///
+/// A sibling that exists must parse: a digest that cannot be read verifies nothing, so a
+/// marker outside the `sha256sum -c` format is a refusal, never a skipped check.
+/// A marker read that fails is an error too: an absent marker is `None`, a broken one is not.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when a local sibling exists but cannot be read, [`Error::Mismatch`]
+/// when a sibling does not parse or diverges from `digest`, and transport, auth or HTTP
+/// errors from the remote marker read.
 #[cfg(not(target_arch = "wasm32"))]
 async fn verify_sibling(
     client: &NexusClient,
@@ -478,34 +469,45 @@ async fn verify_sibling(
     out: &Path,
     part: &Path,
     digest: &Digest,
+    what: &str,
 ) -> Result<(), Error> {
     let mut sibling = out.as_os_str().to_os_string();
     sibling.push(".sha256");
     let sibling = PathBuf::from(sibling);
     let expected = if tokio::fs::try_exists(&sibling).await.unwrap_or(false) {
-        tokio::fs::read_to_string(&sibling)
+        let text = tokio::fs::read_to_string(&sibling)
             .await
-            .ok()
-            .and_then(|t| digest_hex(&t))
+            .map_err(|e| Error::io(&sibling, e))?;
+        Some(parse_marker(&text, out, client)?)
     } else {
-        let remote = format!("{url}.sha256");
-        match client.get_small(&remote).await {
-            Ok(Some(bytes)) => String::from_utf8(bytes).ok().and_then(|t| digest_hex(&t)),
-            _ => None,
-        }
+        sibling_digest(client, url).await?
     };
-    if let Some(expected) = expected {
-        if *digest != expected {
-            tokio::fs::remove_file(part).await.ok();
-            return Err(Error::Mismatch {
-                name: out.display().to_string(),
-                detail: format!(
-                    "segmented content diverges: the .sha256 sibling says {expected}, the bytes hash {digest}"
-                ),
-            });
-        }
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if *digest != expected {
+        tokio::fs::remove_file(part).await.ok();
+        return Err(Error::Mismatch {
+            name: out.display().to_string(),
+            detail: format!(
+                "{what} content diverges: the .sha256 sibling says {expected}, the bytes hash {digest}"
+            ),
+        });
     }
     Ok(())
+}
+
+/// The digest of a local marker file: a foreign line is a refusal, a bare checksum is read and noted.
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_marker(text: &str, out: &Path, client: &NexusClient) -> Result<Digest, Error> {
+    let parsed = crate::model::sibling::parse_line(text).map_err(|reason| Error::Mismatch {
+        name: out.display().to_string(),
+        detail: format!("the local .sha256 marker does not parse: {reason}"),
+    })?;
+    if parsed.name.is_none() {
+        client.events().bare_sibling();
+    }
+    Ok(parsed.digest)
 }
 
 /// The staging directory for a segmented get: `<out>.segments/` beside the output.
@@ -527,17 +529,6 @@ fn part_of(out: &Path) -> PathBuf {
     let mut s = out.as_os_str().to_os_string();
     s.push(".part");
     PathBuf::from(s)
-}
-
-/// The sha256 sum inside a marker-style text (`<hex>` or `<hex>  <name>`).
-#[cfg(not(target_arch = "wasm32"))]
-fn digest_hex(text: &str) -> Option<Digest> {
-    let hex = text.split_whitespace().next()?;
-    if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(Digest::from_hex_string(hex.to_lowercase()))
-    } else {
-        None
-    }
 }
 
 /// The final path segment of a URL, percent-decoded: the marker's name field.

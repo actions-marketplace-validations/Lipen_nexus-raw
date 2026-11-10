@@ -60,7 +60,7 @@ Take it as a version dependency:
 
 ```toml
 [dependencies]
-nexus-raw-core = "0.25"
+nexus-raw-core = "0.26"
 ```
 
 A git pin or a vendored copy still works for special cases.
@@ -93,6 +93,7 @@ let nxr = Nxr::new(
         connect_timeout: Duration::from_secs(15),
         stall_timeout: Duration::from_secs(30),
         auth: Some("Basic Y2ktYm90OnRva2Vu".into()),
+        user_agent: None,
     },
     tx,
 )?;

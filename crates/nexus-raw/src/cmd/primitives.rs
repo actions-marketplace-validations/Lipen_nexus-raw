@@ -1,20 +1,45 @@
 //! The L0 commands: get, put, head, sha.
 
-use std::path::Path;
+use std::io::IsTerminal as _;
+use std::path::{Path, PathBuf};
 
+use nexus_raw_core::config::split_file_url;
+use nexus_raw_core::model::name::ArtifactName;
 use nexus_raw_core::{Error, ShaSource};
 
 use crate::cmd::{finish, make_ctx, print_line, Ctx};
 use crate::Cli;
 
-pub(crate) async fn get(
-    cli: &Cli,
-    url: &str,
-    out: Option<&Path>,
-    cont: bool,
-    segments: Option<usize>,
-    range: Option<&str>,
-) -> Result<(), Error> {
+/// The `get` invocation: the CLI spelling, resolved into what the transfer needs.
+pub(crate) struct GetArgs<'a> {
+    pub url: &'a str,
+    pub out: Option<&'a Path>,
+    pub remote_name: bool,
+    pub stdout: bool,
+    pub cont: bool,
+    pub segments: Option<usize>,
+    pub range: Option<&'a str>,
+    pub no_sha: bool,
+}
+
+pub(crate) async fn get(cli: &Cli, args: GetArgs<'_>) -> Result<(), Error> {
+    let GetArgs {
+        url,
+        out,
+        remote_name,
+        stdout,
+        cont,
+        segments,
+        range,
+        no_sha,
+    } = args;
+    // `-O` turns the URL's last segment into the name; everything below reads one `out`.
+    let named = if remote_name {
+        Some(PathBuf::from(remote_name_of(url)?))
+    } else {
+        None
+    };
+    let out = named.as_deref().or(out);
     if out.is_some_and(|p| p == Path::new("-")) {
         return Err(Error::Misuse(
             "stdout is the default: omit -o for the stream, -o names a real file (a file called - is a trap)"
@@ -43,14 +68,27 @@ pub(crate) async fn get(
             "--continue resumes a sibling part file: pass -o FILE, or drop --continue".to_owned(),
         ));
     }
+    if no_sha && out.is_none() {
+        return Err(Error::Misuse(
+            "the stdout stream is never verified: --no-sha changes nothing there".to_owned(),
+        ));
+    }
     if range.is_some() && (cont || segments.is_some()) {
         return Err(Error::Misuse(
             "--range reads one span: pass --range without --continue or --segments".to_owned(),
         ));
     }
+    // The flag combinations are judged first, because their refusals name the precise
+    // fix. Only a plain fetch reaches the terminal rule, which owns the three ways out.
+    if refuses_a_terminal(out, stdout, std::io::stdout().is_terminal()) {
+        return Err(Error::Misuse(
+            "refusing to write a body to a terminal: use -O for the URL's name here, -o FILE to name the file, or --stdout to stream it anyway"
+                .to_owned(),
+        ));
+    }
     let ctx = make_ctx(cli, url)?;
     // The renderer drains on every path: the events the run already emitted must reach the output before the failure is reported.
-    let result = run_get(&ctx, url, out, cont, segments, range).await;
+    let result = run_get(&ctx, url, out, cont, segments, range, no_sha).await;
     finish(ctx).await;
     result
 }
@@ -62,6 +100,7 @@ async fn run_get(
     cont: bool,
     segments: Option<usize>,
     range: Option<&str>,
+    no_sha: bool,
 ) -> Result<(), Error> {
     if let Some(spec) = range {
         return run_get_range(ctx, url, out, spec).await;
@@ -73,13 +112,41 @@ async fn run_get(
                     url,
                     out.expect("segments require a file target").to_owned(),
                     n,
+                    no_sha,
                 )
                 .await?
         }
-        None => ctx.nxr.get(url, out.map(Path::to_owned), cont).await?,
+        None => {
+            ctx.nxr
+                .get(url, out.map(Path::to_owned), cont, no_sha)
+                .await?
+        }
     };
     report_get(ctx, url, out, &outcome);
     Ok(())
+}
+
+/// Whether a body would land on a terminal: no file target, no explicit `--stdout`.
+/// Split out of the command so the rule is unit-tested without a pty.
+fn refuses_a_terminal(out: Option<&Path>, force: bool, interactive: bool) -> bool {
+    out.is_none() && !force && interactive
+}
+
+/// The local name `get -O` writes: the URL's last path segment, without a query or a fragment.
+fn remote_name_of(url: &str) -> Result<String, Error> {
+    let bare = url.split(['?', '#']).next().unwrap_or(url);
+    let (_, leaf) = split_file_url(bare).ok_or_else(|| {
+        Error::Misuse(format!(
+            "get -O takes the name from a URL that ends at a file, and {bare} ends at a directory: pass -o FILE"
+        ))
+    })?;
+    ArtifactName::parse(&leaf)
+        .map(|name| name.as_str().to_owned())
+        .map_err(|e| {
+            Error::Misuse(format!(
+                "get -O takes the URL's last segment as the name, and the name {leaf:?} is not writable here ({e}): pass -o FILE"
+            ))
+        })
 }
 
 pub(crate) async fn put(
@@ -300,5 +367,28 @@ fn report_get(ctx: &Ctx, url: &str, out: Option<&Path>, outcome: &nexus_raw_core
                 log::debug!("get: {} bytes from {url}", outcome.size);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refuses_a_terminal;
+    use std::path::Path;
+
+    #[test]
+    fn a_terminal_refuses_a_body_unless_asked() {
+        assert!(refuses_a_terminal(None, false, true), "a tty is not a pipe");
+        assert!(
+            !refuses_a_terminal(None, true, true),
+            "--stdout is the opt-in"
+        );
+        assert!(
+            !refuses_a_terminal(None, false, false),
+            "a pipe takes the body"
+        );
+        assert!(
+            !refuses_a_terminal(Some(Path::new("x.bin")), false, true),
+            "a file target never streams"
+        );
     }
 }

@@ -68,6 +68,8 @@ pub enum Event {
     ArtifactStarted {
         name: String,
         dir: Dir,
+        /// The bytes already on disk and reused: a resumed transfer starts here, not at zero.
+        done: u64,
         total: Option<u64>,
     },
     /// Coalesced: at most once per 200 ms per name.
@@ -133,11 +135,16 @@ impl Event {
                 "download": download,
                 "skip": skip,
             }),
-            Event::ArtifactStarted { name, dir, total } => serde_json::json!({
+            Event::ArtifactStarted {
+                name,
+                dir,
+                done,
+                total,
+            } => serde_json::json!({
                 "event": "artifact",
                 "name": name,
                 "state": dir.as_state(),
-                "done": 0,
+                "done": done,
                 "total": total,
             }),
             Event::ArtifactBytes {
@@ -217,6 +224,8 @@ impl Event {
 pub struct Progress {
     tx: mpsc::UnboundedSender<Event>,
     last: Arc<std::sync::Mutex<HashMap<u64, Instant>>>,
+    /// Set once the run has said that a sibling carries the digest alone.
+    bare_sibling: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 const MIN_INTERVAL: Duration = Duration::from_millis(200);
@@ -235,6 +244,7 @@ impl Progress {
         Self {
             tx,
             last: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            bare_sibling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -243,10 +253,11 @@ impl Progress {
         self.tx.clone()
     }
 
-    pub async fn started(&self, name: &str, dir: Dir, total: Option<u64>) {
+    pub async fn started(&self, name: &str, dir: Dir, done: u64, total: Option<u64>) {
         let _ = self.tx.send(Event::ArtifactStarted {
             name: name.to_owned(),
             dir,
+            done,
             total,
         });
     }
@@ -315,6 +326,19 @@ impl Progress {
     }
 
     /// A run-level warning: the caller names what it left out and why.
+    /// Say once per run that a sibling carries the digest alone: a Maven- or
+    /// Gradle-style checksum file is read, and `sha256sum -c` cannot read it.
+    pub fn bare_sibling(&self) {
+        if !self
+            .bare_sibling
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.warning(
+                "a `.sha256` sibling carries the digest alone (a Maven- or Gradle-style checksum): `sha256sum -c` cannot read it, and the bytes are verified anyway",
+            );
+        }
+    }
+
     pub fn warning(&self, text: impl Into<String>) {
         let _ = self.tx.send(Event::Warning { text: text.into() });
     }

@@ -5,7 +5,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.26.0] - 2026-11-10
+
 ### Added
+
+- `nxr get` carries the `User-Agent: nxr/<version>` header, and a binary or binding that links the core names itself through `Config::user_agent`.
+  A Nexus access log says which client asked instead of showing an empty agent, and a proxy that refuses anonymous clients sees a name.
+  The wasm surface keeps the browser's own header, since fetch owns it.
+- A `.sha256` sibling that carries the digest alone, the Maven- and Gradle-style checksum file, is read and verified like any marker, and the run warns once that `sha256sum -c` cannot read the shape.
+  The digest is the whole verification, so the bytes are checked exactly as before. Every writer still produces the canonical line, so a store published by nxr stays portable.
+- `nxr get --no-sha` reads the bytes without verifying the sibling.
+- `nxr get -O` writes to the URL's last path segment in the current directory, curl's `-O`: one file, no local path and no shell redirection.
+- `nxr get` refuses a body headed for a terminal (exit 2) instead of garbling it, and `--stdout` is the explicit opt-in.
+  A pipe and a redirect are unaffected, so `nxr get URL | tar xz` keeps working, and the refusal names `-O`, `-o FILE` and `--stdout`.
+  The segment must pass the artifact grammar, and a directory URL is misuse with `-o FILE` named as the way out.
+- The `marker-crlf` mock scenario stores `.sha256` markers with CRLF line endings: the digest and the name survive, so the object diverges only in how the line reads.
+  The strict parse refuses it, and the core, the CLI and the Python client pin that refusal: the name is `Broken`, `down` refuses it and `up` never overwrites the marker, even when its digest matches the local bytes.
+  The Python client raises the new `MarkerFormat` (an `NxrError` and a `ValueError`, so either catcher works) instead of a bare `ValueError` escaping from `parse_marker`.
 
 - `nxr doctor --json` carries a `code` field on every check: the verdict class (`ok`, `failed`, `skipped`, `anonymous`, `insecure`, `plaintext`, `auth-rejected`, `absent`, `search-dead`, `range-stripped`, `content-length-absent`, `eula-not-accepted`), so a CI job gates on a class instead of matching the prose in `detail`.
   `detail`, the human report and the exit codes are unchanged.
@@ -15,8 +33,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   Two served paths that decode into one name carry no facts when they disagree, the rule the entry listing applies.
   The library exposes the same walk as `Nxr::ls_assets_facts`, and the Node `lsAssets` keeps its `string[]` contract.
 
+### Changed
+
+- `Sibling::name` is `Option<String>`: a bare checksum line names no artifact, so the parsed form says so instead of inventing an empty name.
+- A misuse prints no `hint:` line any more: its message already names the remedy (`--json with stdout body ... pass -o FILE`), and the generic sentence only repeated the error class.
+  `Error::hint()` returns `None` for `Misuse`, the Node payload carries `hint: null` there, and a parse error from clap keeps its own hint because that one names the help command.
+- `nxr get -o FILE` verifies `<URL>.sha256` by default, the way `--continue` and `--segments` already did.
+  A complete object written to a file is now checked everywhere: a matching sibling passes, a missing one skips the check, a marker that does not parse refuses the name, and a divergence refuses it and removes the part.
+  A local `<FILE>.sha256` wins over the server one, so a stale marker refuses a download that would leave an inconsistent pair.
+  `--no-sha` restores the raw fetch, and a stdout stream and `--range` are never verified: one is streamed, the other is a span with no object digest.
+  A refusal over a marker that does not parse carries its own hint now: the marker grammar to write, and `nxr get --no-sha` for the bytes alone, instead of the divergence advice that does not apply.
+- `Progress::started` and `Event::ArtifactStarted` carry the offset a transfer reused, and `NexusClient::download_resumable` returns it alongside the size and the digest.
+  A wrapper that renders progress from its first event sees a resumed transfer start where the part ends, and a restart from zero is reported as zero.
+- A terminal gets the calm view of a transfer: the plan, the live progress line and the summary, instead of one `↑ name ok` line per artifact.
+  A few thousand files no longer bury the progress under their own output.
+  A piped or redirected stdout keeps every name byte for byte, so logs and scripts that parse them are unchanged, and `-v` brings the names back on a terminal.
+  A redirected stderr alone keeps them too, since the live line has nowhere to draw.
+
 ### Fixed
 
+- A resumed transfer reports the offset it reused in its first `artifact` event and in `resumed_from`, and a part the server refuses with `416` reports `0` instead of the discarded part's size.
+  A consumer can render `done` from the first event without a jump, and can add the offset to the bytes it already holds without counting a restart twice.
+- A `get --continue` or `get --segments` run no longer skips its completion check when the `.sha256` sibling does not parse, and a marker read that fails is no longer read as an absent marker.
+  An unreadable digest is a refusal (exit 1) that names the rule, the verdict the rest of the tool gives a foreign marker, so a resume can no longer bless bytes it could not verify.
+  The single-stream resume and both segmented paths share one verifier now.
 - The published-consumer gate in `scripts/verify-published.sh` waits for the platform package to be visible before it installs the shipped copy.
   npm treats an optional dependency the registry has not replicated yet as satisfied by absence, so a release that verified seconds after the publish failed at the addon load with `Cannot find module './nexus-raw.linux-x64-gnu.node'`, and the tag step never ran.
 - The release act's recovery dispatch names the commit that set the version, not whatever `master` holds: the workflow tags the tree it ran on, so a fix that landed on top of a failed publish used to become the tagged tree while the artifacts came from the bump.
@@ -642,7 +682,8 @@ The attach job names its repository without a checkout.
 - The `mock-nexus` server with nine failure scenarios as the conformance contract.
 - The documentation site with README in English and Russian.
 
-[Unreleased]: https://github.com/Lipen/nexus-raw/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/Lipen/nexus-raw/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/Lipen/nexus-raw/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/Lipen/nexus-raw/compare/v0.24.1...v0.25.0
 [0.24.1]: https://github.com/Lipen/nexus-raw/compare/v0.24.0...v0.24.1
 [0.24.0]: https://github.com/Lipen/nexus-raw/compare/v0.23.0...v0.24.0

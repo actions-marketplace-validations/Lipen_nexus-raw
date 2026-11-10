@@ -48,10 +48,15 @@ pub async fn write_marker(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sibling {
     pub digest: Digest,
-    pub name: String,
+    /// The artifact the line names, `None` for a bare checksum line that carries the digest alone.
+    pub name: Option<String>,
 }
 
-/// Strict single-line parse: no CRLF, no extra lines, exactly two spaces.
+/// Single-line parse: no CRLF, no extra lines, and one of the two shapes a sibling comes in.
+///
+/// The canonical `sha256sum -c` line names its artifact, and a Maven- or Gradle-style
+/// checksum file carries the digest alone. Both identify the bytes, so both are read;
+/// a writer always produces the canonical line.
 ///
 /// # Errors
 ///
@@ -64,16 +69,18 @@ pub fn parse_line(s: &str) -> Result<Sibling, String> {
     if body.contains('\r') {
         return Err("CR found: CRLF is not allowed".into());
     }
-    let (hex, name) = body
-        .split_once("  ")
-        .ok_or("two-space separator not found")?;
+    let Some((hex, name)) = body.split_once("  ") else {
+        let digest = Digest::from_hex(body)
+            .map_err(|e| format!("bad digest: {e} (a bare line is read as a checksum file)"))?;
+        return Ok(Sibling { digest, name: None });
+    };
     if name.is_empty() || name.contains("  ") || name.starts_with(' ') {
         return Err("name must be non-empty with exactly two spaces before it".into());
     }
     let digest = Digest::from_hex(hex).map_err(|e| format!("bad digest: {e}"))?;
     Ok(Sibling {
         digest,
-        name: name.to_owned(),
+        name: Some(name.to_owned()),
     })
 }
 
@@ -86,8 +93,29 @@ mod tests {
     #[test]
     fn roundtrip() {
         let parsed = parse_line(OK).unwrap();
-        assert_eq!(parsed.name, "a.zip");
+        assert_eq!(parsed.name.as_deref(), Some("a.zip"));
         assert_eq!(format_line("a.zip", &parsed.digest), OK);
+    }
+
+    /// The common Maven-style checksum: the digest alone, no name. Read, with the name absent.
+    #[test]
+    fn a_bare_digest_is_read() {
+        let bare = format!("{}\n", "0".repeat(64));
+        let parsed = parse_line(&bare).unwrap();
+        assert!(parsed.name.is_none(), "a bare line names no artifact");
+        assert_eq!(parsed.digest.as_str(), "0".repeat(64));
+    }
+
+    /// A bare line still obeys the digest rules: uppercase and short forms are refused.
+    #[test]
+    fn a_bare_line_keeps_the_digest_rules() {
+        let upper = format!("{}\n", "A".repeat(64));
+        assert!(parse_line(&upper).is_err(), "uppercase hex is refused");
+        assert!(
+            parse_line("deadbeef\n").is_err(),
+            "a short digest is refused"
+        );
+        assert!(parse_line(&format!("{}\r\n", "0".repeat(64))).is_err());
     }
 
     #[test]

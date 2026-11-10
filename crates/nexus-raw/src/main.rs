@@ -125,8 +125,16 @@ pub(crate) enum Cmd {
         url: String,
         /// Output file (stdout when omitted).
         /// Must be a real path: `<out>.part` is created beside it while the transfer runs, and `--continue` resumes from that part.
-        #[arg(short = 'o', long, value_name = "FILE")]
+        #[arg(short = 'o', long, value_name = "FILE", conflicts_with = "remote_name")]
         out: Option<PathBuf>,
+        /// Write to the URL's last segment in the current directory, like curl's `-O`.
+        /// The segment must pass the artifact grammar: for any other name, pass `-o FILE`.
+        #[arg(short = 'O', long = "remote-name")]
+        remote_name: bool,
+        /// Stream the body to the terminal anyway.
+        /// A terminal is not a pipe: the body's control bytes would garble the console.
+        #[arg(long, conflicts_with_all = ["out", "remote_name"])]
+        stdout: bool,
         /// Resume from an existing `<out>`.part through a Range request.
         #[arg(long = "continue")]
         cont: bool,
@@ -138,6 +146,10 @@ pub(crate) enum Cmd {
         /// Conflicts with --continue and --segments.
         #[arg(long, value_name = "START-END", conflicts_with_all = ["cont", "segments"])]
         range: Option<String>,
+        /// Read the bytes without verifying `<url>.sha256`.
+        /// File output only: a stdout stream is never verified, and a range has no object digest.
+        #[arg(long = "no-sha")]
+        no_sha: bool,
     },
     /// PUT a file, optionally with its sha-sibling marker.
     Put {

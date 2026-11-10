@@ -72,27 +72,38 @@ All flags are global: they may appear before or after the subcommand.
 | `--ca-bundle <FILE>` | none | a PEM bundle of extra trust roots for a private CA (also `NXR_CA_BUNDLE`). The bundle carries the CA that signed the server certificate, not the bare server leaf. Native only, and mutually exclusive with `--tls-insecure` |
 | `--json` | off | machine output, see [output](#output) |
 | `-q, --quiet` | off | the summary line, plus any failures |
-| `-v, --verbose` | off | plan names and transfer starts |
+| `-v, --verbose` | off | plan names, transfer starts, and a line per settled name on a terminal |
 
 ## nxr get
 
 ```
-nxr get <URL> [-o FILE] [--continue] [--segments N] [--range START-END|START-]
+nxr get <URL> [-o FILE | -O | --stdout] [--no-sha] [--continue] [--segments N] [--range START-END|START-]
 ```
 
 GET a URL to a file or stdout.
 Without `-o` the body goes to stdout in a single attempt: a retry after the body started would duplicate bytes.
+A body headed for a terminal is refused (exit 2): a terminal is not a pipe, and control bytes garble the console, so the refusal names the three ways out, `-O`, `-o FILE` and `--stdout`.
+A pipe, a redirect or `--stdout` bypasses that guard, and `-O` writes the file under its URL name.
 With `-o` the bytes stream into `<FILE>.part`, which is renamed to `FILE` only after the transfer completes.
 
 | Flag | Meaning |
 |:-----|:--------|
 | `-o, --out <FILE>` | output file. stdout when omitted. `-o -` is misuse, because a file called `-` is a trap |
+| `--stdout` | stream the body to a terminal anyway. Conflicts with `-o` and `-O` |
+| `-O, --remote-name` | write to the URL's last path segment in the current directory, curl's `-O`. Conflicts with `-o`. The segment must pass the artifact grammar: anything else is misuse (exit 2) with `-o` named as the way out |
 | `--continue` | resume from an existing `<FILE>.part` through a `Range: bytes=N-` request. The assembled bytes are hashed against the local or server-side `.sha256` sibling before the rename, and a divergence is refused (exit 1) with the part removed |
 | `--segments <N>` | fetch through `N` concurrent byte-range requests (2 to 64). File output only: a stdout target is a misuse (exit 2). `--continue` and `--segments` exclude each other |
 | `--range <RANGE>` | one byte span, `START-END` or `START-`, where `START-` reads to the end. The span goes to `-o` or stdout. Conflicts with `--continue` and `--segments` |
+| `--no-sha` | read the bytes and never look at `<URL>.sha256`. File output only: the stdout stream is never verified, so the flag there is a misuse (exit 2) |
+
+A complete object written to a file is verified by default: after the bytes land in `<FILE>.part`, the client reads the sibling and renames only when the digests agree.
+A local `<FILE>.sha256` beside the target wins over the server one, so a stale local marker refuses the download instead of leaving an inconsistent pair.
+Three cases end the transfer: a remote 404 leaves the object unverifiable and the bytes land, a marker that does not parse is a refusal (exit 1), and a divergence is a refusal that removes the part.
+`--no-sha` is the opt-out, and `--range` cannot be verified at all: a span has no object digest.
+A sibling that carries the digest alone, the Maven-style checksum file, is read and verified, and the run warns once that `sha256sum -c` cannot read that shape.
 
 ```console
-$ nxr get https://nexus.example.com/repository/raw-main/1.4.0/app-1.4.0.zip
+$ nxr get --stdout https://nexus.example.com/repository/raw-main/1.4.0/app-1.4.0.zip
 sample app payload for documentation capture
 $ echo $?
 0
@@ -100,7 +111,14 @@ $ nxr get https://nexus.example.com/repository/raw-main/1.4.0/app-1.4.0.zip -o a
 get: 45 bytes → app.zip
 $ echo $?
 0
+$ nxr get -O https://nexus.example.com/repository/raw-main/1.4.0/app-1.4.0.zip
+get: 45 bytes → app-1.4.0.zip
+$ echo $?
+0
 ```
+
+`-O` takes the name from the URL and writes it into the current directory, so a one-file fetch needs no local path and no shell redirection.
+A URL that ends at a directory, or a last segment outside the artifact grammar (a space, a `?`, a `/`), is misuse: pass `-o FILE` for those.
 
 Resuming from a 20-byte part appends through a Range request and renames when complete:
 
@@ -134,7 +152,7 @@ $ echo $?
 | Exit | When |
 |:----:|:-----|
 | `0` | body delivered |
-| `1` | the URL answered 404 (the object is absent), or local I/O failure around the part file |
+| `1` | the URL answered 404 (the object is absent), the sibling diverges or does not parse, or local I/O failure around the part file |
 | `2` | misuse: a non-http URL, `--segments` with a stdout target, a segment count outside `2..=64`, a malformed `--range`, or `--range` with `--continue`/`--segments` |
 | `3` | auth failure, transport exhaustion: see [errors](errors.md#captured-transcripts) |
 
@@ -148,6 +166,9 @@ $ echo $?
 
 Without `-o` the stdout body is raw bytes and nothing else: stdout mode emits no progress events.
 `--json` without `-o` is refused as misuse (exit 2), and the hint names the two ways out: pass `-o FILE` or drop `--json`.
+
+A resumed transfer starts where the part already ends: the first `artifact` event carries that offset as `done`, and `resumed_from` in the final object repeats it.
+A part the server refuses with `416` and the client restarts from zero reuses nothing, so both report `0` rather than the discarded part's size.
 
 ## nxr put
 
@@ -339,7 +360,6 @@ A claim name outside the scanned directory is misuse:
 ```console
 $ nxr up dist/1.4.0/ https://nexus.example.com/repository/raw-main/claim/ --claim-first nope.txt
 error: misuse: claim-first: nope.txt is not among the scanned names of dist/1.4.0/
-hint: check the command line arguments
 $ echo $?
 2
 ```
@@ -929,6 +949,7 @@ Check local bytes, markers and digests.
 No network.
 Every checked name must be complete: bytes present, sibling present, digest matching.
 Markerless, broken or missing names are reported and the exit is 1.
+A sibling that carries the digest alone, the Maven- or Gradle-style checksum file, is read like the canonical line and the run warns once that `sha256sum -c` cannot read that shape.
 
 ```console
 $ nxr verify dist/1.4.0/
@@ -1285,6 +1306,10 @@ A pipe or a file gets the same lines byte-clean: no escapes, ever.
 A live progress line draws on stderr while stderr is a terminal: one line, redrawn in place, carrying the settled-file counter and the freshest artifact (`↓ 2/5 files · app.zip 1.1 MiB/4.2 MiB (26%)`).
 Pipes never see it, and it is erased before the next human line prints.
 
+With both stdout and stderr on a terminal, that line replaces the settled-name lines: a transfer shows its plan, the live line and the summary, and `-v` asks for the names back.
+A piped or redirected stdout keeps every settled name, so a log still reads one line per artifact.
+A redirected stderr alone keeps them too, because the live line has nowhere to draw.
+
 ```console
 $ nxr -v up dist/1.4.0/ https://nexus.example.com/repository/raw-main/1.4.0/
 plan: 0 to upload, 0 to download, 4 up to date
@@ -1304,12 +1329,14 @@ Artifact lines arrive in worker completion order, not plan order.
 `--json` switches stdout to NDJSON:
 
 - `up`, `down`, `mirror`, `rm`, `verify`, `get -o` and `put` print the event stream (`plan`, `artifact`, `removing`/`removed`/`missing`, `retrying`, `warning`, `summary`).
-  A `warning` event carries `{"event":"warning","text":"<one sentence>"}` and says what the run left out, for example a search listing entry outside the artifact grammar that no transfer can carry.
+  A `warning` event carries `{"event":"warning","text":"<one sentence>"}` and says what the run left out or read loosely, for example a search listing entry outside the artifact grammar that no transfer can carry, or a `.sha256` sibling that carries the digest alone (a Maven-style checksum, warned once per run).
   Every `summary` carries `"kind"`: `"transfer"` for the streams above, `"audit"` for `nxr audit`, which reports its own counts under the same `event` name.
   A transfer `summary` also carries `"failures"`: a list of `{"code","name"}` objects for the same artifacts as `failed`, in the same order, where `code` is the exit-code class (1 data, 2 misuse, 3 transport).
   `failed` keeps its legacy strings, so a digest mismatch there still reads `name: detail`, while `failures` always carries the bare name.
 - `head`, `sha`, `channel`, `point` and `doctor` print their objects described in their sections above.
+- an `artifact` event's `done` is the absolute progress of that attempt: on a resume it starts at the bytes already on disk, and a retry that resumes a part continues from what survived.
 - the body of `get` without `-o` is the only thing on stdout: no events are printed in stdout mode, and `--json` without `-o` is refused as misuse (exit 2).
+  A body headed for a terminal is refused too, unless `--stdout` asks for it.
 - a failed run ends stdout with one `error` object before the non-zero exit, carrying the exit `code` and the `hint` that stderr carries:
 
 ```json

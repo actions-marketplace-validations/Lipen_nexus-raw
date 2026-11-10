@@ -46,6 +46,19 @@ fn nxr(args: &[&str]) -> Output {
         .expect("nxr binary runs")
 }
 
+/// The same hermetic run from `cwd`: for flags whose output name comes from the URL.
+fn nxr_in(args: &[&str], cwd: &Path) -> Output {
+    Command::new(NXR)
+        .current_dir(cwd)
+        .args(args)
+        .env_remove("NXR_AUTH")
+        .env_remove("NXR_USERNAME")
+        .env_remove("NXR_PASSWORD")
+        .env_remove("NXR_CA_BUNDLE")
+        .output()
+        .expect("nxr binary runs")
+}
+
 /// The same hermetic run with `stdin` piped in: for `--names-from -`.
 fn nxr_stdin(args: &[&str], stdin: &str) -> Output {
     use std::io::Write;
@@ -157,12 +170,17 @@ fn ndjson(out: &Output) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// A clap parse error is misuse 2 with a hint, and `--json` carries the same failure.
+/// A clap parse error is misuse 2, and `--json` carries the same failure.
+/// Clap prints its own usage line, so the error class carries no second sentence.
 #[test]
-fn a_bad_flag_is_misuse_with_a_hint() {
+fn a_bad_flag_is_misuse_with_usage() {
     let out = nxr(&["--bogus"]);
     expect_exit(&out, 2, "an unknown flag is misuse");
-    assert!(stderr(&out).contains("hint:"), "got: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("Usage:"),
+        "clap names the usage line: {}",
+        stderr(&out)
+    );
 
     let json = nxr(&["--json", "--bogus"]);
     expect_exit(&json, 2, "an unknown flag is misuse in json mode too");
@@ -1528,7 +1546,11 @@ fn tls_insecure_is_reported_and_zero_timeout_is_misuse() {
     );
     let zero = nxr(&["--connect-timeout-secs", "0", "doctor"]);
     expect_exit(&zero, 2, "a zero timeout is misuse");
-    assert!(stderr(&zero).contains("hint:"), "{}", stderr(&zero));
+    assert!(
+        !stderr(&zero).contains("hint:"),
+        "the failing check names the setting, a hint would repeat it: {}",
+        stderr(&zero)
+    );
 }
 
 /// `rm --names-from` deletes exactly the listed names.
@@ -1803,6 +1825,527 @@ fn get_continue_refuses_a_diverged_part() {
     );
 }
 
+/// Every marker outside the strict `sha256sum -c` grammar refuses the resume, the
+/// spellings a loose parse used to bless included: uppercase hex, one space, no newline.
+#[test]
+fn get_continue_refuses_every_marker_outside_the_grammar() {
+    let digest = test_hex(BETA);
+    let cases = [
+        (
+            "uppercase hex",
+            format!("{}  obj.bin\n", digest.to_uppercase()),
+        ),
+        ("one space", format!("{digest} obj.bin\n")),
+        ("no trailing newline", format!("{digest}  obj.bin")),
+        ("not a digest", "deadbeef  obj.bin\n".to_owned()),
+    ];
+    for (what, marker) in cases {
+        let srv = server(Scenario::Atomic);
+        let dir = root_url(&srv);
+        srv.insert("obj.bin", BETA);
+        srv.insert("obj.bin.sha256", marker.as_bytes());
+
+        let out = TempDir::new().unwrap();
+        let target = out.path().join("obj.bin");
+        std::fs::write(out.path().join("obj.bin.part"), &BETA[..8]).unwrap();
+        let url = format!("{dir}obj.bin");
+        let got = nxr(&["get", "--continue", &url, "-o", target.to_str().unwrap()]);
+        expect_exit(&got, 1, what);
+        assert!(
+            stderr(&got).contains("does not parse"),
+            "{what}: the refusal names the rule it applied: {}",
+            stderr(&got)
+        );
+        assert!(
+            !target.exists(),
+            "{what}: nothing partial is renamed into place"
+        );
+    }
+}
+
+/// A resumed transfer reports the reused offset in its start event, so a consumer that
+/// renders `done` never sees the stream jump back to zero.
+#[test]
+fn get_continue_reports_the_reused_offset_at_start() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("obj.bin", BETA);
+    let url = format!("{dir}obj.bin");
+
+    let out = TempDir::new().unwrap();
+    let target = out.path().join("obj.bin");
+    std::fs::write(out.path().join("obj.bin.part"), &BETA[..8]).unwrap();
+    let got = nxr(&[
+        "get",
+        "--json",
+        "--continue",
+        &url,
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    expect_exit(&got, 0, "the honest resume lands");
+    let events = ndjson(&got);
+    let started = events
+        .iter()
+        .find(|e| e["event"] == "artifact" && e["state"] == "downloading")
+        .expect("the start event");
+    assert_eq!(
+        started["done"], 8,
+        "the start event carries the prefix the attempt reused"
+    );
+}
+
+/// A complete object written to a file is verified: the matching sibling passes.
+#[test]
+fn get_verifies_the_sibling_by_default() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("obj.bin", BETA);
+    srv.insert(
+        "obj.bin.sha256",
+        format!("{}  obj.bin\n", test_hex(BETA)).as_bytes(),
+    );
+    let out = TempDir::new().unwrap();
+    let target = out.path().join("obj.bin");
+    let got = nxr(&[
+        "get",
+        &format!("{dir}obj.bin"),
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    expect_exit(&got, 0, "a matching sibling passes");
+    assert_eq!(std::fs::read(&target).unwrap(), BETA);
+}
+
+/// A diverged remote marker refuses the file: no bytes and no part survive.
+#[test]
+fn get_refuses_a_diverged_sibling() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("obj.bin", BETA);
+    srv.insert(
+        "obj.bin.sha256",
+        format!("{}  obj.bin\n", "0".repeat(64)).as_bytes(),
+    );
+    let out = TempDir::new().unwrap();
+    let target = out.path().join("obj.bin");
+    let got = nxr(&[
+        "get",
+        &format!("{dir}obj.bin"),
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    expect_exit(&got, 1, "a diverged sibling is a data refusal");
+    assert!(
+        stderr(&got).contains("diverges"),
+        "the refusal names the divergence: {}",
+        stderr(&got)
+    );
+    assert!(!target.exists(), "the refused file must not land");
+    assert!(
+        !out.path().join("obj.bin.part").exists(),
+        "the part is removed with the refusal"
+    );
+}
+
+/// A missing sibling skips the check: there is nothing to verify against.
+#[test]
+fn get_skips_an_absent_sibling() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("obj.bin", BETA);
+    let out = TempDir::new().unwrap();
+    let target = out.path().join("obj.bin");
+    let got = nxr(&[
+        "get",
+        &format!("{dir}obj.bin"),
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    expect_exit(&got, 0, "no sibling, nothing to check");
+    assert_eq!(std::fs::read(&target).unwrap(), BETA);
+}
+
+/// An unparseable sibling is a refusal, never a skipped check.
+#[test]
+fn get_refuses_an_unparseable_sibling() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("obj.bin", BETA);
+    srv.insert("obj.bin.sha256", b"deadbeef  obj.bin\n");
+    let out = TempDir::new().unwrap();
+    let target = out.path().join("obj.bin");
+    let got = nxr(&[
+        "get",
+        &format!("{dir}obj.bin"),
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    expect_exit(&got, 1, "an unreadable digest cannot verify anything");
+    assert!(
+        stderr(&got).contains("does not parse"),
+        "the refusal names the rule: {}",
+        stderr(&got)
+    );
+    assert!(!target.exists());
+}
+
+/// A local sibling beside the target wins over the remote one: a stale marker refuses the
+/// download, because the landing pair would contradict itself.
+#[test]
+fn get_refuses_a_stale_local_sibling() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("obj.bin", BETA);
+    srv.insert(
+        "obj.bin.sha256",
+        format!("{}  obj.bin\n", test_hex(BETA)).as_bytes(),
+    );
+    let out = TempDir::new().unwrap();
+    let target = out.path().join("obj.bin");
+    std::fs::write(
+        out.path().join("obj.bin.sha256"),
+        format!("{}  obj.bin\n", "0".repeat(64)),
+    )
+    .unwrap();
+    let got = nxr(&[
+        "get",
+        &format!("{dir}obj.bin"),
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    expect_exit(&got, 1, "the local pair is the one being extended");
+    assert!(
+        stderr(&got).contains("diverges"),
+        "the refusal names the divergence: {}",
+        stderr(&got)
+    );
+    assert!(!target.exists());
+}
+
+/// A Maven- or Gradle-style checksum file (the digest alone) is read: the bytes land,
+/// and the run says once that the marker is not a `sha256sum -c` line.
+#[test]
+fn down_reads_a_bare_checksum_marker() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("obj.bin", BETA);
+    srv.insert("obj.bin.sha256", format!("{}\n", test_hex(BETA)).as_bytes());
+    srv.insert("two.bin", ALPHA);
+    srv.insert(
+        "two.bin.sha256",
+        format!("{}\n", test_hex(ALPHA)).as_bytes(),
+    );
+    let dst = TempDir::new().unwrap();
+    let got = nxr(&[
+        "--json",
+        "down",
+        &dir,
+        dst.path().to_str().unwrap(),
+        "--name",
+        "obj.bin",
+        "--name",
+        "two.bin",
+    ]);
+    expect_exit(
+        &got,
+        0,
+        "a bare checksum verifies the bytes like any marker",
+    );
+    assert_eq!(std::fs::read(dst.path().join("obj.bin")).unwrap(), BETA);
+    assert_eq!(std::fs::read(dst.path().join("two.bin")).unwrap(), ALPHA);
+    let events = ndjson(&got);
+    let warnings: Vec<_> = events.iter().filter(|e| e["event"] == "warning").collect();
+    assert_eq!(warnings.len(), 1, "one warning per run: {events:?}");
+    assert!(
+        warnings[0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("digest alone"),
+        "the warning names the shape: {warnings:?}"
+    );
+}
+
+/// The warning also reaches a plain stderr, once, next to the transfer lines.
+#[test]
+fn a_bare_checksum_marker_warns_on_stderr() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("obj.bin", BETA);
+    srv.insert("obj.bin.sha256", format!("{}\n", test_hex(BETA)).as_bytes());
+    let dst = TempDir::new().unwrap();
+    let got = nxr(&[
+        "down",
+        &dir,
+        dst.path().to_str().unwrap(),
+        "--name",
+        "obj.bin",
+    ]);
+    expect_exit(&got, 0, "the transfer lands");
+    let err = stderr(&got);
+    assert_eq!(
+        err.matches("warning:").count(),
+        1,
+        "one warning line: {err}"
+    );
+    assert!(
+        err.contains("digest alone"),
+        "the warning names the shape: {err}"
+    );
+}
+
+/// `verify` reads a bare checksum sibling offline and says once that it is not the canonical line.
+#[test]
+fn verify_reads_a_bare_checksum_and_warns() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "a.bin", BETA);
+    std::fs::write(
+        dir.path().join("a.bin.sha256"),
+        format!("{}\n", test_hex(BETA)),
+    )
+    .unwrap();
+    let got = nxr(&["verify", dir.path().to_str().unwrap()]);
+    expect_exit(&got, 0, "the pair is complete");
+    let err = stderr(&got);
+    assert_eq!(
+        err.matches("warning:").count(),
+        1,
+        "one warning line: {err}"
+    );
+    assert!(
+        err.contains("digest alone"),
+        "the warning names the shape: {err}"
+    );
+}
+
+/// A bare checksum that disagrees with the bytes is a refusal like any other marker.
+#[test]
+fn a_bare_checksum_that_diverges_refuses() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("obj.bin", BETA);
+    srv.insert("obj.bin.sha256", format!("{}\n", "0".repeat(64)).as_bytes());
+    let dst = TempDir::new().unwrap();
+    let got = nxr(&[
+        "down",
+        &dir,
+        dst.path().to_str().unwrap(),
+        "--name",
+        "obj.bin",
+    ]);
+    expect_exit(&got, 1, "a divergent digest is a data refusal");
+    assert!(!dst.path().join("obj.bin").exists());
+}
+
+/// The mock's `marker-crlf` scenario on the fresh path: a marker the strict parse
+/// refuses stops a plain `get -o`, not only a resume.
+#[test]
+fn get_refuses_a_crlf_sibling_on_the_fresh_path() {
+    let srv = server(Scenario::MarkerCrlf);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "obj.bin", BETA);
+    let dir = root_url(&srv);
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &dir]),
+        0,
+        "the upload lands and the server rewrites the marker it stored",
+    );
+
+    let out = TempDir::new().unwrap();
+    let target = out.path().join("obj.bin");
+    let got = nxr(&[
+        "get",
+        &format!("{dir}obj.bin"),
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    expect_exit(&got, 1, "a marker outside the grammar refuses the download");
+    assert!(
+        stderr(&got).contains("CRLF"),
+        "the refusal names the rule that rejected the marker: {}",
+        stderr(&got)
+    );
+    assert!(!target.exists(), "the refused file must not land");
+}
+
+/// A stdout stream is never verified: the bytes go out as they arrive, so the
+/// diverged sibling cannot turn a successful stream into a refusal.
+#[test]
+fn get_to_stdout_never_verifies() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("obj.bin", BETA);
+    srv.insert(
+        "obj.bin.sha256",
+        format!("{}  obj.bin\n", "0".repeat(64)).as_bytes(),
+    );
+    let got = nxr(&["get", &format!("{dir}obj.bin")]);
+    expect_exit(&got, 0, "the stream cannot be checked after the bytes left");
+    assert_eq!(got.stdout.as_slice(), BETA, "the bytes are the object");
+}
+
+/// `--no-sha` promises bytes without siblings, the local one included: a stale
+/// marker beside the target must not refuse an opted-out download.
+#[test]
+fn get_no_sha_ignores_a_local_sibling_too() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("obj.bin", BETA);
+    srv.insert(
+        "obj.bin.sha256",
+        format!("{}  obj.bin\n", test_hex(BETA)).as_bytes(),
+    );
+    let out = TempDir::new().unwrap();
+    let target = out.path().join("obj.bin");
+    std::fs::write(
+        out.path().join("obj.bin.sha256"),
+        format!("{}  obj.bin\n", "0".repeat(64)),
+    )
+    .unwrap();
+    let got = nxr(&[
+        "get",
+        "--no-sha",
+        &format!("{dir}obj.bin"),
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    expect_exit(&got, 0, "--no-sha reads the bytes only");
+    assert_eq!(std::fs::read(&target).unwrap(), BETA);
+}
+
+/// `--stdout` names the stream explicitly, and a file target excludes it.
+#[test]
+fn get_stdout_flag_conflicts_with_a_file() {
+    let got = nxr(&["get", "--stdout", "-o", "x.bin", "http://127.0.0.1:1/x.bin"]);
+    expect_exit(&got, 2, "the stream and a file exclude each other");
+}
+
+/// `get -O` writes the URL's last segment into the current directory: one file, no redirect.
+#[test]
+fn get_remote_name_writes_the_url_leaf() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("bom/obj.bin", BETA);
+    let cwd = TempDir::new().unwrap();
+    let url = format!("{dir}bom/obj.bin");
+    let got = nxr_in(&["get", "-O", "--no-sha", &url], cwd.path());
+    expect_exit(&got, 0, "the leaf names the file");
+    assert_eq!(std::fs::read(cwd.path().join("obj.bin")).unwrap(), BETA);
+}
+
+/// `get -O --no-sha` is the whole answer for a repository whose marker is foreign:
+/// the bytes land under the URL's name and the unreadable marker does not block them.
+#[test]
+fn get_remote_name_takes_a_foreign_marker_with_no_sha() {
+    let srv = server(Scenario::MarkerCrlf);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "obj.bin", BETA);
+    let dir = root_url(&srv);
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &dir]),
+        0,
+        "the upload lands and the server rewrites the marker",
+    );
+    let cwd = TempDir::new().unwrap();
+    let url = format!("{dir}obj.bin");
+
+    let refused = nxr_in(&["get", "-O", &url], cwd.path());
+    expect_exit(&refused, 1, "the foreign marker refuses the default");
+    assert!(
+        stderr(&refused).contains("sha256sum"),
+        "the hint names the format and the way out: {}",
+        stderr(&refused)
+    );
+
+    let got = nxr_in(&["get", "-O", "--no-sha", &url], cwd.path());
+    expect_exit(&got, 0, "--no-sha takes the bytes alone");
+    assert_eq!(std::fs::read(cwd.path().join("obj.bin")).unwrap(), BETA);
+}
+
+/// `-O` and `-o` name the same thing: clap refuses both at once.
+#[test]
+fn get_remote_name_conflicts_with_out() {
+    let got = nxr(&["get", "-O", "-o", "x.bin", "http://127.0.0.1:1/x.bin"]);
+    expect_exit(&got, 2, "two names for one file");
+}
+
+/// `-O` on a directory URL has no leaf to take: misuse, with `-o` named.
+#[test]
+fn get_remote_name_on_a_directory_url_is_misuse() {
+    let got = nxr(&["get", "-O", "http://127.0.0.1:1/repository/raw-main/1.4.0/"]);
+    expect_exit(&got, 2, "a directory URL has no name");
+    assert!(
+        stderr(&got).contains("pass -o FILE"),
+        "the hint names the way out: {}",
+        stderr(&got)
+    );
+}
+
+/// `--no-sha` reads the bytes without looking at the sibling: the raw curl behaviour.
+#[test]
+fn get_no_sha_skips_the_check() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    srv.insert("obj.bin", BETA);
+    srv.insert(
+        "obj.bin.sha256",
+        format!("{}  obj.bin\n", "0".repeat(64)).as_bytes(),
+    );
+    let out = TempDir::new().unwrap();
+    let target = out.path().join("obj.bin");
+    let got = nxr(&[
+        "get",
+        "--no-sha",
+        &format!("{dir}obj.bin"),
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    expect_exit(&got, 0, "--no-sha opts out of the sibling");
+    assert_eq!(std::fs::read(&target).unwrap(), BETA);
+}
+
+/// `--no-sha` on a stdout stream is a dead flag: the stream is never verified.
+#[test]
+fn get_no_sha_without_output_is_misuse() {
+    let srv = server(Scenario::Atomic);
+    let dir = root_url(&srv);
+    let got = nxr(&["get", "--no-sha", &format!("{dir}obj.bin")]);
+    expect_exit(&got, 2, "the stream is never verified");
+    assert!(
+        stderr(&got).contains("never verified"),
+        "the hint names the reason: {}",
+        stderr(&got)
+    );
+}
+
+/// The same rule on the local side: a sibling that exists but does not parse refuses the name.
+#[test]
+fn get_continue_refuses_an_unparseable_local_marker() {
+    let srv = server(Scenario::Atomic);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "obj.bin", b"PAYLOAD");
+    let dir = root_url(&srv);
+    expect_exit(
+        &nxr(&["up", src.path().to_str().unwrap(), &dir]),
+        0,
+        "publishing seeds the bytes the resume fetches",
+    );
+
+    let out = TempDir::new().unwrap();
+    let target = out.path().join("obj.bin");
+    std::fs::write(out.path().join("obj.bin.part"), b"PAY").unwrap();
+    std::fs::write(out.path().join("obj.bin.sha256"), b"deadbeef  obj.bin\n").unwrap();
+    let url = format!("{dir}obj.bin");
+    let got = nxr(&["get", "--continue", &url, "-o", target.to_str().unwrap()]);
+    expect_exit(&got, 1, "a local marker that does not parse is a refusal");
+    assert!(
+        stderr(&got).contains("local .sha256 marker does not parse"),
+        "the refusal names the local file: {}",
+        stderr(&got)
+    );
+    assert!(!target.exists(), "nothing partial is renamed into place");
+}
+
 /// A part longer than the object answers 416: the client must prove it holds
 /// the whole object before finalizing, and restart from zero when it does not.
 #[test]
@@ -1819,6 +2362,7 @@ fn get_continue_restarts_an_oversized_part() {
 
     let got = nxr(&[
         "get",
+        "--json",
         "--continue",
         &url,
         "-o",
@@ -1827,6 +2371,12 @@ fn get_continue_restarts_an_oversized_part() {
         "1",
     ]);
     expect_exit(&got, 0, "the stale part restarts and completes");
+    let events = ndjson(&got);
+    let outcome = events.last().expect("the result line");
+    assert_eq!(
+        outcome["resumed_from"], 0,
+        "a restart from zero reuses nothing and must not claim the stale part's size"
+    );
     assert_eq!(
         std::fs::read(&target).unwrap(),
         content,
@@ -2897,7 +3447,7 @@ fn get_resume_validates_against_the_sibling() {
     srv.insert("1.14.0/a.zip", BETA);
     srv.insert(
         "1.14.0/a.zip.sha256",
-        format!("{}\n", test_hex(BETA)).as_bytes(),
+        format!("{}  a.zip\n", test_hex(BETA)).as_bytes(),
     );
     let url = format!("{}a.zip", dir_url(&srv));
 
@@ -2923,7 +3473,7 @@ fn get_resume_with_matching_part_succeeds() {
     srv.insert("1.14.0/a.zip", BETA);
     srv.insert(
         "1.14.0/a.zip.sha256",
-        format!("{}\n", test_hex(BETA)).as_bytes(),
+        format!("{}  a.zip\n", test_hex(BETA)).as_bytes(),
     );
     let url = format!("{}a.zip", dir_url(&srv));
 
@@ -3217,6 +3767,43 @@ fn foreign_marker_down_refuses() {
     assert!(
         !dst.path().join("a.zip.part").exists(),
         "the part is dropped on a mismatch"
+    );
+}
+
+/// marker-crlf: the marker parses only by a loose rule, so the name is Broken and the download refuses with exit 1.
+#[test]
+fn crlf_marker_down_refuses() {
+    let srv = server(Scenario::MarkerCrlf);
+    let src = TempDir::new().unwrap();
+    write_file(src.path(), "a.zip", ALPHA);
+    let up = nxr(&["up", src.path().to_str().unwrap(), &dir_url(&srv)]);
+    expect_exit(
+        &up,
+        0,
+        "the upload lands, the server rewrites the marker it stored",
+    );
+
+    let dst = TempDir::new().unwrap();
+    let down = nxr(&[
+        "down",
+        &dir_url(&srv),
+        dst.path().to_str().unwrap(),
+        "--name",
+        "a.zip",
+    ]);
+    expect_exit(&down, 1, "an unparseable marker is a data refusal");
+    let stderr = String::from_utf8_lossy(&down.stderr);
+    assert!(
+        stderr.contains("CRLF"),
+        "the refusal names the parse rule that rejected the marker: {stderr}"
+    );
+    assert!(
+        !dst.path().join("a.zip").exists(),
+        "the refused download must not land"
+    );
+    assert!(
+        !dst.path().join("a.zip.part").exists(),
+        "the part is dropped on a refusal"
     );
 }
 
@@ -3748,7 +4335,10 @@ fn complete_unknown_shell_is_misuse_exit_2() {
         err.contains("misuse: unknown shell: tcsh (use bash, zsh, fish or powershell)"),
         "the error names the shell and the supported four: {err}"
     );
-    assert!(err.contains("hint:"), "the misuse hint is printed: {err}");
+    assert!(
+        !err.contains("hint:"),
+        "a misuse names its remedy in the message, with no second line: {err}"
+    );
 }
 
 // ---- doctor ---------------------------------------------------------------
@@ -3919,7 +4509,11 @@ fn doctor_exit_codes() {
 
     let broken = nxr(&["--retry", "0", "doctor"]);
     expect_exit(&broken, 2, "a setting the commands refuse fails the check");
-    assert!(stderr(&broken).contains("hint:"));
+    assert!(
+        !stderr(&broken).contains("hint:"),
+        "the report names the failing check, a hint would repeat it: {}",
+        stderr(&broken)
+    );
 
     // Deep probes talk to a server: without a URL they would silently do
     // nothing and still report "all checks passed".

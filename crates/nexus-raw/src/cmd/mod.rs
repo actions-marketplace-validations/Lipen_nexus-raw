@@ -65,10 +65,28 @@ async fn run(cli: &Cli) -> Result<(), Error> {
         Cmd::Get {
             url,
             out,
+            remote_name,
+            stdout,
             cont,
             segments,
             range,
-        } => primitives::get(cli, url, out.as_deref(), *cont, *segments, range.as_deref()).await,
+            no_sha,
+        } => {
+            primitives::get(
+                cli,
+                primitives::GetArgs {
+                    url,
+                    out: out.as_deref(),
+                    remote_name: *remote_name,
+                    stdout: *stdout,
+                    cont: *cont,
+                    segments: *segments,
+                    range: range.as_deref(),
+                    no_sha: *no_sha,
+                },
+            )
+            .await
+        }
         Cmd::Put {
             url,
             file,
@@ -297,6 +315,7 @@ pub(crate) fn make_nxr_with(
         connect_timeout: Duration::from_secs(cli.connect_timeout_secs),
         stall_timeout: Duration::from_secs(cli.stall_secs),
         auth,
+        user_agent: None,
     };
     Nxr::new(cfg, sender)
 }
