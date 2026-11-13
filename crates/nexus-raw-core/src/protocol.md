@@ -82,11 +82,18 @@ A service-API 404 (`service repos` against a server without the management API) 
 
 The transfer worker pool is adaptive (§7 retries).
 A directory transfer (`up`, `down`, `mirror`, and `mv`'s pour) starts with as many workers as `--workers` grants.
+The plan phase runs under the same budget: the probes that plan an `up`, a `down`, a `diff` or a `mirror` are the run's first remote requests, so a `Retry-After` there keeps the pressure down for the transfer that follows instead of handing it a fresh maximum.
 When a retryable request fails with a `Retry-After` (a 429, or a 5xx that asks for a pause), the effective limit halves at once: the run stops acquiring new workers past the reduced limit, and permits still held are surrendered as their transfers finish.
 The floor is 1 worker: some transfer always goes on.
 On a streak of successes (one step per four consecutive successes) the limit recovers one worker at a time, never exceeding the configured maximum.
 A single success after a server-mandated pause does not restore the limit: the recovery slope must fill first.
 The wire behavior is unchanged: only how many transfers run at once.
+
+A run stops opening connections after 16 consecutive transport failures.
+Every request already spent its own retry budget on the same outage, so the remaining names fail at once with [`Error::Transport`] (exit 3) instead of walking the list against a server that stopped answering.
+A `Retry-After` answer is not counted: the budget above already responds to it, and a server that asks for patience is not a server that stopped answering.
+One success clears the streak: a partial outage keeps the run going.
+The floor above describes a run that is still talking to the server, not one the breaker stopped.
 
 ## Range and segmented reads
 
