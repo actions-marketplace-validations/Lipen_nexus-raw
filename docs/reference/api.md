@@ -40,7 +40,7 @@ flowchart BT
 
 ```toml
 [dependencies]
-nexus-raw-core = "0.27"
+nexus-raw-core = "0.29"
 ```
 
 ## The facade
@@ -94,15 +94,17 @@ Every method mirrors a CLI command one-to-one.
 
 | Method | Returns | Mirrors | Contract |
 |:--------|:--------|:--------|:---------|
-| `get(url, out, cont, no_sha)` | `GetOutcome` | `nxr get` | stream a URL to a file or stdout, resume through `<out>.part`, and verify the `.sha256` sibling of a complete file unless `no_sha` asks for the raw bytes |
+| `get(url, out, cont, no_sha)` | `GetOutcome` | `nxr get` | stream a URL to a file or stdout, resume through `<out>.part`, and verify the `.sha256` sibling of a complete file unless `no_sha` asks for the raw bytes. A part parked by `get_span` resumes that span, with no sibling check |
 | `new(cfg, events)` | `Nxr` | - | build the facade from a `Config` and an event channel |
 | `base()` | `&str` | - | the normalized base URL of this invocation |
 | `last_run_limit()` | `(usize, usize)` | - | the adaptive worker limit of the last directory transfer: the current value and the lowest it reached |
-| `get_range(url, spec)` | `RangeOutcome` | `nxr get --range` | one `START-END`/`START-` span: HEAD for the open form, a past-the-end start is misuse |
+| `get_segmented_span(url, spec, out, segments)` | `SpanOutcome` | `nxr get --range --segments` | fetch one span through `N` concurrent closed ranges, assemble it into `<out>.part`, and keep progress absolute |
+| `get_span(url, spec, out, cont)` | `SpanOutcome` | `nxr get --range`, the napi `get` range | stream one `START-END`/`START-`/`-N` span: a file target writes `<out>.part` with absolute progress, resumes through the recorded manifest, and restarts a span whose object changed |
+| `get_range(url, spec)` | `RangeOutcome` | - | one `START-END`/`START-` span in memory: HEAD for the open form, a past-the-end start is misuse |
 | `read_range(url, start, len)` | `Option<Vec<u8>>` | the mount read path | one in-memory byte span, and `None` means the object is absent |
 | `put(url, src, sha)` | `(u64, Option<Digest>)` | `nxr put` | PUT a file, optionally with its sha-sibling |
 | `put_bytes(url, body, sha)` | `(u64, Option<Digest>)` | `nxr put --stdin` | the same PUT from memory: bytes first, the marker after, the name checked before the first request |
-| `head(url)` | `HeadInfo` | `nxr head` | status and metadata: 404 is a normal result, not an error |
+| `head(url)` | `HeadInfo` | `nxr head` | status and metadata: size, content type, ETag and Last-Modified. 404 is a normal result, not an error |
 | `sha(src)` | `Digest` | `nxr sha` | stream a `ShaSource::File` or `ShaSource::Url` through sha256 |
 | `scan(dir)` | `Vec<ArtifactName>` | the `up` input set | the plain-mode local listing `up` starts from |
 | `scan_prefixes(dir, prefixes)` | `Vec<ArtifactName>` | the `up --prefix` input set | only the selected subtrees are read, keeping each prefix in the name |
@@ -192,6 +194,8 @@ async fn local_digest(nxr: &Nxr, path: &str) -> Result<Digest, nexus_raw_core::E
 ```
 
 `GetOutcome` carries `size`, the `digest` of the written file (stdout mode skips hashing and returns `None`), and `resumed_from`, the part offset the transfer continued from (`0` for a fresh download).
+`SpanOutcome` carries the resolved `start` and optional `end`, the span's `size` (not the object size), and `resumed_from`, the span prefix the transfer continued from.
+`primitive::list_parked_spans(dir)` returns a `ParkedSpan` per recorded manifest, which is what `nxr resume` renders.
 `RangeOutcome` carries the inclusive `start`, the optional `end`, and the `bytes` of the span.
 
 ## L1: transfer
@@ -251,6 +255,7 @@ The NDJSON shapes are fixed by golden tests, and `Event::to_json()` is the singl
 | `Plan { upload, download, skip }` | once per transfer, before execution | `{"event":"plan","upload":["a.zip"],"download":[],"skip":[]}` |
 | `ArtifactStarted { name, dir, total }` | when a name begins moving | `{"event":"artifact","name":"a.zip","state":"uploading","done":0,"total":38}` |
 | `ArtifactBytes { name, dir, done, total }` | coalesced: at most one per 200 ms per name | `{"event":"artifact","name":"a.zip","state":"downloading","done":12,"total":38}` |
+| `ArtifactSpanBytes { name, dir, done, total, start, end }` | coalesced ranged progress: absolute `done`, full `total`, plus the span bounds | `{"event":"artifact","name":"tail.bin","state":"downloading","done":1048576,"total":4194304,"range_start":1048576,"range_end":null}` |
 | `ArtifactDone { name, dir, skipped, done, total }` | when a name settles | `{"event":"artifact","name":"a.zip","state":"done","done":38,"total":38}` |
 | `Retrying { name, attempt, reason }` | before each replayed attempt | `{"event":"retrying","name":"a.zip","attempt":2,"reason":"transport: …"}` |
 | `Removing { name }` | before a name's DELETEs go out | `{"event":"removing","name":"a.zip"}` |

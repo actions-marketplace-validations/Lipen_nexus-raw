@@ -7,6 +7,47 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 Nothing yet.
 
+## [0.29.0] - 2026-11-20
+
+### Added
+
+- `nxr get --range -N` reads the last N bytes, resolved through a HEAD to a normal `START-` span.
+- `nxr get --range --segments N` splits a span into N concurrent closed ranges, with the same absolute progress and no digest verification.
+- `nxr get -C -` and `-C N` are the curl-style resume aliases for `--continue` and `--range N-`.
+- `nxr resume [DIR]` lists parked ranged downloads with their URL, span and parked bytes, and prints the `--continue` command that finishes each one.
+- `--json-stderr` sends the NDJSON events to stderr, so a stdout body stays byte-exact while scripts read events.
+- `nxr get --range` warns when the server ignores Range, naming the prefix bytes fetched and discarded.
+
+### Changed
+
+- The parked span record is now a small manifest with the source URL, full object size and strong ETag.
+  A resume of another URL is refused, and a changed size or ETag restarts the span from its beginning.
+  `If-Range` is sent only with a strong ETag, because a weak one or `Last-Modified` can miss a rewrite.
+- The mock server sends a strong ETag and honors `If-Range`, so the changed-object restart is exercised on the wire.
+
+### Fixed
+
+- `nxr resume` ignores a manifest `part` that is not a bare file name, so a crafted record cannot point the listing at a path outside its directory.
+- A resumed span now says when its parked record has no strong ETag, instead of trusting a same-size rewrite silently.
+
+## [0.28.0] - 2026-11-19
+
+### Added
+
+- `nxr get --range A-B --continue` resumes a parked span, recorded bounds and all, so a killed ranged run keeps its bytes without repeating `--range`.
+  A part with no span record is refused when `--range` names the span.
+
+### Changed
+
+- A ranged file download streams into `<out>.part` with the artifact events of a whole download.
+  `done` is now the absolute object position, `total` is the full object length, and the first event precedes the first byte.
+  Downstream consumers that add the range base to `done` must drop it.
+  The napi `get` range path uses the same streaming core.
+
+### Fixed
+
+- An open-ended range probe names its real failure: a 401 or 404 status, a missing `Content-Length`, or a start past the object's end with the size and the start.
+
 ## [0.27.0] - 2026-11-13
 
 ### Added
@@ -695,7 +736,9 @@ The attach job names its repository without a checkout.
 - The `mock-nexus` server with nine failure scenarios as the conformance contract.
 - The documentation site with README in English and Russian.
 
-[Unreleased]: https://github.com/Lipen/nexus-raw/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/Lipen/nexus-raw/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/Lipen/nexus-raw/compare/v0.28.0...v0.29.0
+[0.28.0]: https://github.com/Lipen/nexus-raw/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/Lipen/nexus-raw/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/Lipen/nexus-raw/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/Lipen/nexus-raw/compare/v0.24.1...v0.25.0

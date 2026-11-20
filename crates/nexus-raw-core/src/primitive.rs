@@ -20,7 +20,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::error::Error;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::events::Dir;
+use crate::events::{Dir, Event};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::model::digest;
 use crate::model::digest::Digest;
@@ -56,9 +56,22 @@ pub struct RangeOutcome {
     pub bytes: Vec<u8>,
 }
 
+/// A streaming byte span: the resolved bounds and what landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(not(target_arch = "wasm32"))]
+pub struct SpanOutcome {
+    pub start: u64,
+    pub end: Option<u64>,
+    /// Bytes written for the span, not the full object size.
+    pub size: u64,
+    /// Span bytes that were already on disk and reused (0 for a fresh span).
+    pub resumed_from: u64,
+}
+
 /// GET a URL.
 ///
 /// With `out`: stream into `<out>.part` (resuming from it when `cont`), verify nothing, then rename to `out`.
+/// A `<out>.part` parked by a ranged download resumes that span, recorded bounds and all, and a span has no object digest to verify.
 /// Without `out`: stream to stdout in a single body attempt, because a retry after the body started would duplicate bytes.
 ///
 /// # Errors
@@ -73,6 +86,37 @@ pub async fn get(
     no_sha: bool,
 ) -> Result<GetOutcome, Error> {
     if let Some(out) = out {
+        if cont {
+            let part = part_of(&out);
+            if let Some(record) = read_span_record(&part)? {
+                if part_len(&part)? > 0 {
+                    let record = reconcile_span_record(&part, url, record.start, record.end)?;
+                    let probe = probe_span(client, url, record.start, record.end).await?;
+                    let span = get_span_to_file(
+                        client,
+                        url,
+                        record.start,
+                        record.end,
+                        &out,
+                        true,
+                        probe,
+                        record,
+                    )
+                    .await?;
+                    return Ok(GetOutcome {
+                        size: span.size,
+                        digest: None,
+                        resumed_from: span.resumed_from,
+                    });
+                }
+            }
+            // A record without its part is stale state.
+            clear_span_record(&out);
+        } else {
+            // A fresh whole-object run discards a parked span, part included:
+            // the tail bytes cannot be a whole-object prefix.
+            clear_parked_span(&out)?;
+        }
         let part = part_of(&out);
         let name = out
             .file_name()
@@ -113,7 +157,11 @@ pub async fn get(
         })
     } else {
         let resp = client.get_stream(url).await?;
-        // No progress events in stdout mode: anything the renderer prints would corrupt the body.
+        // Byte events only: the human renderer draws them on stderr, so a
+        // stdout body stays clean even with `-v` or `--json-stderr`.
+        let name = last_segment(url);
+        let total = resp.content_length();
+        client.progress().bytes(&name, Dir::Down, 0, total).await;
         let mut body = resp.bytes_stream();
         let mut stdout = tokio::io::stdout();
         let mut size: u64 = 0;
@@ -127,6 +175,7 @@ pub async fn get(
                 }
             })?;
             size += chunk.len() as u64;
+            client.progress().bytes(&name, Dir::Down, size, total).await;
         }
         stdout.flush().await.map_err(|e| Error::Io {
             path: "stdout".into(),
@@ -138,6 +187,241 @@ pub async fn get(
             resumed_from: 0,
         })
     }
+}
+
+/// GET one byte span as a stream (spec §5.1 `get --range`).
+///
+/// A file target streams into `<out>.part` exactly like a whole-object download:
+/// the part grows while the transfer runs, and `--continue` resumes it through
+/// `Range: bytes=(start + part_len)-`.
+/// The span the part belongs to is recorded beside it, so a later
+/// `--continue` needs no repeated `--range`.
+/// A stdout target streams the cut span straight out, with no retry after the
+/// first byte (a retry would duplicate bytes on the stream).
+/// Progress events carry absolute object positions and the full object length;
+/// an open-ended span learns both from a HEAD, which also names a probe failure
+/// (a status, a missing size, or a start past the end).
+///
+/// # Errors
+///
+/// Returns transport, auth or HTTP errors from the HEAD or GET, [`Error::Io`]
+/// when the part cannot be written or renamed, and [`Error::Misuse`] for a
+/// malformed range or a start past the object's end.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn get_span(
+    client: &NexusClient,
+    url: &str,
+    spec: &str,
+    out: Option<PathBuf>,
+    cont: bool,
+) -> Result<SpanOutcome, Error> {
+    let (start, end, probe) = resolve_span(client, url, spec).await?;
+    match out {
+        Some(out) => {
+            let part = part_of(&out);
+            let record = if cont {
+                reconcile_span_record(&part, url, start, end)?
+            } else {
+                // A fresh span owns the part: bytes recorded for another span
+                // or another URL, or unrecorded bytes, cannot be its prefix.
+                // The same span of the same URL is kept until the first answer
+                // truncates it, so a failed fresh retry still resumes cleanly.
+                let recorded = read_span_record(&part)?;
+                let requested_url = resume_url(url);
+                let same = recorded.as_ref().is_some_and(|r| {
+                    (r.start, r.end) == (start, end)
+                        && r.url.as_deref().is_none_or(|u| u == requested_url)
+                });
+                if !same {
+                    let _ = std::fs::remove_file(&part);
+                }
+                SpanRecord {
+                    url: Some(requested_url),
+                    start,
+                    end,
+                    total: None,
+                    etag: None,
+                    last_modified: None,
+                    part: None,
+                }
+            };
+            get_span_to_file(client, url, start, end, &out, cont, probe, record).await
+        }
+        None => {
+            let size = client.stream_span(url, start, end, probe.total).await?;
+            Ok(SpanOutcome {
+                start,
+                end,
+                size,
+                resumed_from: 0,
+            })
+        }
+    }
+}
+
+/// The warning a resumed span owes when its parked record carries no strong
+/// validator: a same-size rewrite cannot be ruled out.
+#[cfg(not(target_arch = "wasm32"))]
+fn validator_warning(
+    cont: bool,
+    had_prefix: bool,
+    restart: bool,
+    old_strong: Option<&str>,
+) -> Option<&'static str> {
+    (cont && had_prefix && !restart && old_strong.is_none()).then_some(
+        "the parked part has no strong ETag: a same-size rewrite cannot be detected, so the resumed span may mix two versions",
+    )
+}
+
+/// The file half of [`get_span`]: fill the record, stream into the part, rename,
+/// and drop the record.
+/// The bounds and the part state are already reconciled by the caller.
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "wasm32"))]
+async fn get_span_to_file(
+    client: &NexusClient,
+    url: &str,
+    start: u64,
+    end: Option<u64>,
+    out: &Path,
+    cont: bool,
+    probe: SpanProbe,
+    mut record: SpanRecord,
+) -> Result<SpanOutcome, Error> {
+    let part = part_of(out);
+    let old_total = record.total;
+    let old_strong = strong_etag(record.etag.as_deref()).map(str::to_owned);
+    let had_prefix = part_len(&part)? > 0;
+    // The probe describes the object now. Compare it with what the part was
+    // written against before the record is overwritten, or the new validator
+    // would match its own object and splice the old bytes silently.
+    let mut restart = false;
+    if cont && had_prefix {
+        if let (Some(old), Some(new)) = (old_total, probe.total) {
+            if old != new {
+                restart = true;
+            }
+        }
+        if let (Some(old), Some(new)) = (old_strong.as_deref(), strong_etag(probe.etag.as_deref()))
+        {
+            if old != new {
+                restart = true;
+            }
+        }
+    }
+    if restart {
+        let _ = std::fs::remove_file(&part);
+        let _ = client.events().sender().send(Event::Warning {
+            text: "the object changed since the part was written: the span restarts from its beginning"
+                .to_owned(),
+        });
+    }
+    if let Some(text) = validator_warning(cont, had_prefix, restart, old_strong.as_deref()) {
+        let _ = client.events().sender().send(Event::Warning {
+            text: text.to_owned(),
+        });
+    }
+    record.url = Some(resume_url(url));
+    record.start = start;
+    record.end = end;
+    record.part = part
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    // With a parked prefix still in play, the probe describes the object now,
+    // not the bytes already on disk. Writing its validator into the record
+    // would bless those old bytes for the next resume. Keep the parked values
+    // until the part is discarded or the transfer completes.
+    if !had_prefix || restart {
+        if probe.total.is_some() {
+            record.total = probe.total;
+        }
+        if probe.etag.is_some() {
+            record.etag = probe.etag;
+        }
+        if probe.last_modified.is_some() {
+            record.last_modified = probe.last_modified;
+        }
+    }
+    write_span_record(&part, &record)?;
+    // A fresh run has nothing to validate, a restart just discarded the part,
+    // and a weak ETag cannot prove the object unchanged inside the same second:
+    // only the parked strong ETag goes out.
+    let if_range = if cont && !restart && had_prefix {
+        old_strong.as_deref()
+    } else {
+        None
+    };
+    let resumed = cont && !restart;
+    let name = out
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (resumed_from, size, _) = client
+        .download_span(
+            (&name, Dir::Down),
+            url,
+            start,
+            end,
+            &part,
+            resumed,
+            record.total,
+            if_range,
+        )
+        .await?;
+    tokio::fs::rename(&part, out)
+        .await
+        .map_err(|e| Error::io(out, e))?;
+    let _ = std::fs::remove_file(span_record_path(&part));
+    Ok(SpanOutcome {
+        start,
+        end,
+        size,
+        resumed_from,
+    })
+}
+
+/// The span a parked `<out>.part` belongs to, when a prior ranged run recorded
+/// it. `None` when no part exists or the part carries no span record (a whole
+/// object download).
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the part or its record cannot be read, and a
+/// record outside `START END` is refused rather than misread as a whole part.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn recorded_span(out: &Path) -> Result<Option<(u64, Option<u64>)>, Error> {
+    let part = part_of(out);
+    match std::fs::symlink_metadata(&part) {
+        Ok(meta) if meta.is_file() => Ok(read_span_record(&part)?.map(|r| (r.start, r.end))),
+        Ok(_) => Err(Error::Io {
+            path: part.display().to_string(),
+            detail: "the part path is not a regular file".to_owned(),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::io(&part, e)),
+    }
+}
+
+/// Drop a parked span: its record and the tail part it describes.
+/// A fresh whole-object or segmented run owns the part now.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the record cannot be read.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn clear_parked_span(out: &Path) -> Result<(), Error> {
+    let part = part_of(out);
+    if read_span_record(&part)?.is_some() {
+        let _ = std::fs::remove_file(&part);
+        clear_span_record(out);
+    }
+    Ok(())
+}
+
+/// Drop a parked span record: a fresh whole-object run owns the part now.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn clear_span_record(out: &Path) {
+    let _ = std::fs::remove_file(span_record_path(&part_of(out)));
 }
 
 /// PUT a file, optionally with its sha-sibling marker (spec §5.1).
@@ -321,28 +605,89 @@ pub async fn get_segmented(
             resumed_from: 0,
         });
     }
-    // Every segment spans at least one byte. Spans are `total / segments` sized with
+    let (size, digest) = segment_ranges(
+        client,
+        url,
+        out,
+        segments,
+        events,
+        no_sha,
+        SegmentWindow {
+            start: 0,
+            end: total.saturating_sub(1),
+            total,
+        },
+        false,
+    )
+    .await?;
+    Ok(GetOutcome {
+        size,
+        digest,
+        resumed_from: 0,
+    })
+}
+
+/// The object window a segmented download covers.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy)]
+struct SegmentWindow {
+    start: u64,
+    /// Inclusive.
+    end: u64,
+    /// The full object length, for absolute progress.
+    total: u64,
+}
+
+/// The fan-out of [`get_segmented`] and [`get_segmented_span`].
+///
+/// `span` selects the progress shape and the digest rule: a whole object is
+/// hashed and verified against its sibling, a span is neither.
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "wasm32"))]
+async fn segment_ranges(
+    client: &NexusClient,
+    url: &str,
+    out: &Path,
+    segments: usize,
+    events: &crate::events::Progress,
+    no_sha: bool,
+    window: SegmentWindow,
+    span: bool,
+) -> Result<(u64, Option<Digest>), Error> {
+    let name = out
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let part = part_of(out);
+    let len = window.end.saturating_sub(window.start).saturating_add(1);
+    // Every segment spans at least one byte. Spans are `len / segments` sized with
     // the remainder spread over the leading segments.
-    let base = total / segments as u64;
+    let base = len / segments as u64;
     let segments = if base == 0 {
-        // The object is smaller than the segment count: one segment per byte,
+        // The window is smaller than the segment count: one segment per byte,
         // computed iteratively (a recursive degrade re-entered this huge frame
         // on the same stack and overflowed the default windows thread stack).
-        total as usize
+        len as usize
     } else {
         segments
     };
-    let base = total / segments as u64;
-    let rem = total % segments as u64;
+    let base = len / segments as u64;
+    let rem = len % segments as u64;
+    if span {
+        events
+            .started(&name, Dir::Down, window.start, Some(window.total))
+            .await;
+    }
     let staging = temp_staging_dir(out).await?;
     let mut bounds: Vec<(u64, u64)> = Vec::with_capacity(segments);
-    let mut start: u64 = 0;
+    let mut offset: u64 = 0;
     for i in 0..segments {
-        let len = base + u64::from(i < rem as usize);
-        bounds.push((start, start + len - 1));
-        start += len;
+        let size = base + u64::from(i < rem as usize);
+        let start = window.start + offset;
+        bounds.push((start, start + size - 1));
+        offset += size;
     }
-    debug_assert_eq!(start, total, "the spans must tile the object exactly");
+    debug_assert_eq!(offset, len, "the spans must tile the window exactly");
 
     // Each segment streams into its own staging file, concurrently, retries included.
     // The worker ceiling still applies: `--segments` splits the object, it does
@@ -356,13 +701,35 @@ pub async fn get_segmented(
             let url = url.to_owned();
             let name = name.clone();
             let workers = workers.clone();
+            let progress_at = if span {
+                crate::transport::client::RangeProgress {
+                    base: start,
+                    total: Some(window.total),
+                    span: Some((window.start, window.end)),
+                    announce: false,
+                }
+            } else {
+                crate::transport::client::RangeProgress {
+                    base: 0,
+                    total: None,
+                    span: None,
+                    announce: true,
+                }
+            };
             async move {
                 let _permit = workers
                     .acquire_owned()
                     .await
                     .expect("the worker semaphore is never closed");
                 let done = client
-                    .fetch_range((&name, Dir::Down), &url, start, end_incl, &file)
+                    .fetch_range_in(
+                        (&name, Dir::Down),
+                        &url,
+                        start,
+                        end_incl,
+                        &file,
+                        progress_at,
+                    )
                     .await
                     .map_err(|e| (i, e))?;
                 Ok::<(usize, u64), (usize, Error)>((i, done))
@@ -390,23 +757,98 @@ pub async fn get_segmented(
     }
 
     // Positional assembly into the part file: each segment streams in at its offset.
-    assemble(&bounds, &staging, &part, total).await?;
-    // One read pass over the assembled file: the digest, then the sibling verdict.
-    let digest = crate::model::digest::sha256_file(&part).map_err(|e| Error::io(&part, e))?;
-    if !no_sha {
-        verify_sibling(client, url, out, &part, &digest, "segmented").await?;
-    }
+    assemble(&bounds, &staging, &part, len, window.start).await?;
+    let digest = if span {
+        None
+    } else {
+        let digest = crate::model::digest::sha256_file(&part).map_err(|e| Error::io(&part, e))?;
+        if !no_sha {
+            verify_sibling(client, url, out, &part, &digest, "segmented").await?;
+        }
+        Some(digest)
+    };
     tokio::fs::rename(&part, out)
         .await
         .map_err(|e| Error::io(out, e))?;
     // The staging area only outlives a failed run.
     let _ = tokio::fs::remove_dir_all(&staging).await;
-    events
-        .done(&name, Dir::Down, false, total, Some(total))
-        .await;
-    Ok(GetOutcome {
-        size: total,
-        digest: Some(digest),
+    if span {
+        events
+            .done(
+                &name,
+                Dir::Down,
+                false,
+                window.end.saturating_add(1),
+                Some(window.total),
+            )
+            .await;
+    } else {
+        events
+            .done(&name, Dir::Down, false, window.total, Some(window.total))
+            .await;
+    }
+    Ok((len, digest))
+}
+
+/// GET one span through `segments` concurrent closed ranges (spec §5.1 `get --range --segments`).
+///
+/// The span resolves like the single-stream path (including `-N`), the object
+/// size comes from the HEAD, and the window splits into contiguous segments.
+/// Progress is absolute against the full object, and a span has no digest to verify.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn get_segmented_span(
+    client: &NexusClient,
+    url: &str,
+    spec: &str,
+    out: &Path,
+    segments: usize,
+    events: &crate::events::Progress,
+) -> Result<SpanOutcome, Error> {
+    if !(2..=MAX_SEGMENTS).contains(&segments) {
+        return Err(Error::misuse(format!(
+            "segments must be between 2 and {MAX_SEGMENTS}, got {segments}"
+        )));
+    }
+    let (start, end, probe) = resolve_span(client, url, spec).await?;
+    let Some(total) = probe.total else {
+        return Err(Error::transport(
+            url,
+            "the object size is unknown: --segments needs a Content-Length",
+        ));
+    };
+    if total == 0 || start >= total {
+        return Err(Error::Misuse(format!(
+            "range starts at {start}, past the end of {total} bytes"
+        )));
+    }
+    let concrete_end = end.unwrap_or(total.saturating_sub(1)).min(total - 1);
+    if concrete_end < start {
+        return Err(Error::Misuse(format!(
+            "range ends at {concrete_end}, before its start {start}"
+        )));
+    }
+    // A segmented run assembles the part from scratch; a parked span record
+    // would misread that part as resume state.
+    clear_parked_span(out)?;
+    let (size, _) = segment_ranges(
+        client,
+        url,
+        out,
+        segments,
+        events,
+        true,
+        SegmentWindow {
+            start,
+            end: concrete_end,
+            total,
+        },
+        true,
+    )
+    .await?;
+    Ok(SpanOutcome {
+        start,
+        end,
+        size,
         resumed_from: 0,
     })
 }
@@ -419,6 +861,7 @@ pub(crate) async fn assemble(
     staging: &Path,
     part: &Path,
     total: u64,
+    origin: u64,
 ) -> Result<(), Error> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
     let mut out = crate::transport::client::write_options(false)
@@ -431,7 +874,7 @@ pub(crate) async fn assemble(
         let mut seg = tokio::fs::File::open(&file)
             .await
             .map_err(|e| Error::io(&file, e))?;
-        out.seek(std::io::SeekFrom::Start(start))
+        out.seek(std::io::SeekFrom::Start(start.saturating_sub(origin)))
             .await
             .map_err(|e| Error::io(part, e))?;
         let mut buf = [0u8; 64 * 1024];
@@ -529,6 +972,395 @@ fn part_of(out: &Path) -> PathBuf {
     let mut s = out.as_os_str().to_os_string();
     s.push(".part");
     PathBuf::from(s)
+}
+
+/// The span record of a parked part: a `.nxr`-prefixed hidden file beside it,
+/// keyed by the part's file name. The prefix reserves the name from the
+/// artifact grammar, so `up` never publishes local resume state.
+#[cfg(not(target_arch = "wasm32"))]
+fn span_record_path(part: &Path) -> PathBuf {
+    let parent = part
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file = part.file_name().unwrap_or(part.as_os_str());
+    let token = digest::hex(&Sha256::digest(file.as_encoded_bytes())[..16]);
+    parent.join(format!(".nxr-span-{token}"))
+}
+
+/// The parked-span manifest beside a part.
+/// A strong ETag is the only validator a resume sends through `If-Range`.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SpanRecord {
+    /// The object URL with userinfo, query and fragment removed.
+    #[serde(default)]
+    url: Option<String>,
+    start: u64,
+    #[serde(default)]
+    end: Option<u64>,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    etag: Option<String>,
+    /// Stored for diagnosis, never sent as `If-Range`.
+    #[serde(default)]
+    last_modified: Option<String>,
+    /// The part file name, so a resume listing can pair the record with its bytes.
+    #[serde(default)]
+    part: Option<String>,
+}
+
+/// The part length, 0 when it does not exist.
+#[cfg(not(target_arch = "wasm32"))]
+fn part_len(part: &Path) -> Result<u64, Error> {
+    match std::fs::symlink_metadata(part) {
+        Ok(meta) if meta.is_file() => Ok(meta.len()),
+        Ok(_) => Err(Error::Io {
+            path: part.display().to_string(),
+            detail: "the part path is not a regular file".to_owned(),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(Error::io(part, e)),
+    }
+}
+
+/// The URL as a resume identity: a different query, fragment or credential
+/// never changes which object the part holds.
+#[cfg(not(target_arch = "wasm32"))]
+fn resume_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut url) => {
+            url.set_query(None);
+            url.set_fragment(None);
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.to_string()
+        }
+        Err(_) => url.to_owned(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn bad_span_record(path: &Path) -> Error {
+    Error::Io {
+        path: path.display().to_string(),
+        detail: "the span record does not parse: delete it and the part".to_owned(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_span_record(part: &Path) -> Result<Option<SpanRecord>, Error> {
+    let path = span_record_path(part);
+    let bytes = match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_file() => std::fs::read(&path).map_err(|e| Error::io(&path, e))?,
+        Ok(_) => {
+            return Err(Error::Io {
+                path: path.display().to_string(),
+                detail: "the span record is not a regular file".to_owned(),
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io(&path, e)),
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|_| bad_span_record(&path))?;
+    Ok(Some(parse_span_record(text, &path)?))
+}
+
+/// Parse a record file body: the JSON manifest or the 0.28.0 plain `START END` line.
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_span_record(text: &str, path: &Path) -> Result<SpanRecord, Error> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(bad_span_record(path));
+    }
+    if text.starts_with('{') {
+        let record: SpanRecord = serde_json::from_str(text).map_err(|_| bad_span_record(path))?;
+        if record.end.is_some_and(|e| e < record.start) {
+            return Err(bad_span_record(path));
+        }
+        return Ok(record);
+    }
+    // 0.28.0 wrote one plain `START END` line.
+    let (start, end) = text.split_once(' ').ok_or_else(|| bad_span_record(path))?;
+    let start = start.parse::<u64>().map_err(|_| bad_span_record(path))?;
+    let end = match end.trim() {
+        "-" => None,
+        n => Some(n.parse::<u64>().map_err(|_| bad_span_record(path))?),
+    };
+    if end.is_some_and(|e| e < start) {
+        return Err(bad_span_record(path));
+    }
+    Ok(SpanRecord {
+        url: None,
+        start,
+        end,
+        total: None,
+        etag: None,
+        last_modified: None,
+        part: None,
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_span_record_file(path: &Path) -> Result<SpanRecord, Error> {
+    let bytes = std::fs::read(path).map_err(|e| Error::io(path, e))?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| bad_span_record(path))?;
+    parse_span_record(text, path)
+}
+
+/// A record's `part` is a bare file name in the record's directory.
+/// A crafted manifest must never point `resume` at a file outside that directory.
+#[cfg(not(target_arch = "wasm32"))]
+fn safe_part_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.ends_with(".part")
+        && !name.contains(['/', '\\', ':'])
+        && name != "."
+        && name != ".."
+}
+
+/// One parked ranged download, as listed by [`list_parked_spans`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(not(target_arch = "wasm32"))]
+pub struct ParkedSpan {
+    /// The output path the part would be renamed to.
+    pub out: Option<PathBuf>,
+    /// The part file, when the record names it or a legacy record matches one.
+    pub part: Option<PathBuf>,
+    pub url: Option<String>,
+    pub start: u64,
+    pub end: Option<u64>,
+    pub total: Option<u64>,
+    /// Bytes already parked in the part.
+    pub part_size: u64,
+}
+
+/// List the parked span manifests in `dir`.
+/// A malformed record is a refusal, not a silently skipped row.
+/// A 0.28.0 record has no `part` field: its part is recovered by matching
+/// `span_record_path(part)` against the record file name.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the directory or a record cannot be read, and a
+/// malformed record is refused.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn list_parked_spans(dir: &Path) -> Result<Vec<ParkedSpan>, Error> {
+    let mut records = Vec::new();
+    let mut parts = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| Error::io(dir, e))? {
+        let entry = entry.map_err(|e| Error::io(dir, e))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let path = entry.path();
+        let meta = entry.metadata().map_err(|e| Error::io(&path, e))?;
+        if !meta.is_file() {
+            continue;
+        }
+        if name.starts_with(".nxr-span-") {
+            records.push(path);
+        } else if name.ends_with(".part") {
+            parts.push(path);
+        }
+    }
+    let mut parked = Vec::new();
+    for path in records {
+        let record = read_span_record_file(&path)?;
+        let part = record
+            .part
+            .as_deref()
+            .filter(|name| safe_part_name(name))
+            .map(|part| dir.join(part))
+            .or_else(|| {
+                parts
+                    .iter()
+                    .find(|part| span_record_path(part) == path)
+                    .cloned()
+            });
+        let part_size = part
+            .as_deref()
+            .map_or(0, |part| part_len(part).unwrap_or(0));
+        let out = part
+            .as_ref()
+            .and_then(|part| part.file_stem().map(|stem| dir.join(stem)));
+        parked.push(ParkedSpan {
+            out,
+            part,
+            url: record.url,
+            start: record.start,
+            end: record.end,
+            total: record.total,
+            part_size,
+        });
+    }
+    parked.sort_by(|a, b| a.out.cmp(&b.out));
+    Ok(parked)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_span_record(part: &Path, record: &SpanRecord) -> Result<(), Error> {
+    let bytes = serde_json::to_vec(record).map_err(|e| Error::Io {
+        path: span_record_path(part).display().to_string(),
+        detail: format!("the span record cannot serialize: {e}"),
+    })?;
+    write_bytes_atomically(&span_record_path(part), &bytes)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn span_label(start: u64, end: Option<u64>) -> String {
+    match end {
+        Some(e) => format!("{start}-{e}"),
+        None => format!("{start}-"),
+    }
+}
+
+/// A `--continue` that names a span must name the same span of the same object
+/// the part holds.
+/// An empty part carries no bytes to misplace, so a new span or URL may claim it.
+/// A non-empty part without a record belongs to a whole-object download, and
+/// appending a span after its bytes would assemble an artifact no request described.
+#[cfg(not(target_arch = "wasm32"))]
+fn reconcile_span_record(
+    part: &Path,
+    url: &str,
+    start: u64,
+    end: Option<u64>,
+) -> Result<SpanRecord, Error> {
+    let recorded = read_span_record(part)?;
+    let requested_url = resume_url(url);
+    let requested = SpanRecord {
+        url: Some(requested_url.clone()),
+        start,
+        end,
+        total: None,
+        etag: None,
+        last_modified: None,
+        part: None,
+    };
+    if part_len(part)? == 0 {
+        return Ok(recorded.unwrap_or(requested));
+    }
+    let Some(recorded) = recorded else {
+        return Err(Error::Misuse(format!(
+            "the part {} has no span record: rerun without --continue to start the span over, or delete the part",
+            part.display()
+        )));
+    };
+    if (recorded.start, recorded.end) != (start, end) {
+        let recorded_label = span_label(recorded.start, recorded.end);
+        let requested_label = span_label(start, end);
+        return Err(Error::Misuse(format!(
+            "the part {} holds the span {recorded_label}, not {requested_label}: pass --continue with the recorded range, or delete the part",
+            part.display()
+        )));
+    }
+    if let Some(recorded_url) = &recorded.url {
+        if recorded_url != &requested_url {
+            return Err(Error::Misuse(format!(
+                "the part {} belongs to {recorded_url}, not {requested_url}: delete the part, or resume the original URL",
+                part.display()
+            )));
+        }
+    }
+    Ok(recorded)
+}
+
+/// The strong ETag, the only validator `If-Range` accepts.
+/// A weak `W/...` value can match an object rewritten inside the same second.
+#[cfg(not(target_arch = "wasm32"))]
+fn strong_etag(etag: Option<&str>) -> Option<&str> {
+    etag.filter(|value| !value.trim_start().starts_with("W/"))
+}
+
+/// What the resume probe learned about the object.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Default)]
+struct SpanProbe {
+    total: Option<u64>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+/// The full object metadata a span can use.
+/// An open span requires the HEAD, a closed span treats it as best effort,
+/// so a server without HEAD still serves an explicit `START-END`.
+#[cfg(not(target_arch = "wasm32"))]
+async fn probe_span(
+    client: &NexusClient,
+    url: &str,
+    start: u64,
+    end: Option<u64>,
+) -> Result<SpanProbe, Error> {
+    if end.is_some() {
+        return Ok(match client.head_transfer(url).await {
+            Ok(info) => SpanProbe {
+                total: info.size,
+                etag: info.etag,
+                last_modified: info.last_modified,
+            },
+            Err(_) => SpanProbe::default(),
+        });
+    }
+    let info = client.head_transfer(url).await?;
+    let Some(size) = info.size else {
+        return Err(Error::Misuse(format!(
+            "the server did not report a size for {url}: the open-ended range needs a Content-Length; use START-END instead"
+        )));
+    };
+    if start >= size {
+        return Err(Error::Misuse(format!(
+            "range starts at {start}, past the end of {size} bytes"
+        )));
+    }
+    Ok(SpanProbe {
+        total: Some(size),
+        etag: info.etag,
+        last_modified: info.last_modified,
+    })
+}
+
+/// Resolve `START-END`, `START-` or the curl-style suffix `-N` into concrete bounds and a probe.
+#[cfg(not(target_arch = "wasm32"))]
+async fn resolve_span(
+    client: &NexusClient,
+    url: &str,
+    spec: &str,
+) -> Result<(u64, Option<u64>, SpanProbe), Error> {
+    if let Some(suffix) = spec.strip_prefix('-') {
+        let n = suffix
+            .parse::<u64>()
+            .map_err(|_| Error::Misuse(format!("range suffix is not a number: {spec}")))?;
+        if n == 0 {
+            return Err(Error::Misuse(
+                "range suffix must cover at least one byte".to_owned(),
+            ));
+        }
+        let info = client.head_transfer(url).await?;
+        let Some(size) = info.size else {
+            return Err(Error::Misuse(format!(
+                "the server did not report a size for {url}: the suffix range needs a Content-Length"
+            )));
+        };
+        if size == 0 {
+            return Err(Error::Misuse(format!(
+                "the object is empty: {url} has no suffix to read"
+            )));
+        }
+        let start = size.saturating_sub(n);
+        return Ok((
+            start,
+            None,
+            SpanProbe {
+                total: Some(size),
+                etag: info.etag,
+                last_modified: info.last_modified,
+            },
+        ));
+    }
+    let (start, end) = parse_range(spec)?;
+    let probe = probe_span(client, url, start, end).await?;
+    Ok((start, end, probe))
 }
 
 /// The final path segment of a URL, percent-decoded: the marker's name field.
@@ -648,9 +1480,45 @@ mod tests {
     }
 
     #[test]
-    fn refuses_malformed_ranges() {
-        for spec in ["", "10", "-5", "19-10", "x-2", "1-x", "1-2-3", " 1-2"] {
-            assert!(parse_range(spec).is_err(), "{spec:?} must be refused");
-        }
+    fn a_record_cannot_point_outside_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(".nxr-span-deadbeef");
+        std::fs::write(&record, r#"{"start":0,"part":"../../etc/passwd"}"#).unwrap();
+        let parked = list_parked_spans(dir.path()).unwrap();
+        assert_eq!(parked.len(), 1);
+        assert!(parked[0].part.is_none(), "a traversal part is ignored");
+        assert!(parked[0].out.is_none());
+        assert_eq!(parked[0].part_size, 0);
+    }
+
+    #[test]
+    fn a_safe_part_name_pairs_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("tail.bin.part");
+        std::fs::write(&part, b"abc").unwrap();
+        std::fs::write(
+            span_record_path(&part),
+            r#"{"start":0,"part":"tail.bin.part"}"#,
+        )
+        .unwrap();
+        let parked = list_parked_spans(dir.path()).unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].part.as_deref(), Some(part.as_path()));
+        assert_eq!(
+            parked[0].out.as_deref(),
+            Some(dir.path().join("tail.bin").as_path())
+        );
+        assert_eq!(parked[0].part_size, 3);
+    }
+
+    #[test]
+    fn a_resume_without_a_strong_etag_warns() {
+        assert!(validator_warning(true, true, false, None)
+            .unwrap()
+            .contains("no strong ETag"));
+        assert!(validator_warning(true, true, false, Some("\"abc\"")).is_none());
+        assert!(validator_warning(false, true, false, None).is_none());
+        assert!(validator_warning(true, false, false, None).is_none());
+        assert!(validator_warning(true, true, true, None).is_none());
     }
 }

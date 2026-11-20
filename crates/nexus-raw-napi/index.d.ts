@@ -64,6 +64,10 @@ export interface NxrEvent {
   done?: number
   /** `artifact` only: total bytes when known. */
   total?: number | null
+  /** `artifact` only: the absolute start of the fetched span when the event describes a ranged download. */
+  range_start?: number
+  /** `artifact` only: the inclusive span end, or null for an open-ended span. */
+  range_end?: number | null
   /** `retrying` only. */
   attempt?: number
   reason?: string
@@ -119,11 +123,11 @@ export interface NxrPlan {
 export interface NxrGetOpts extends NxrCommonOpts {
   /** Output file. Without it the body streams to the process stdout, like the CLI. */
   out?: string
-  /** Resume from an existing `<out>.part` through a Range request. */
+  /** Resume from an existing `<out>.part` through a Range request. A part parked by `range` resumes that span. */
   cont?: boolean
   /** Read the bytes without verifying `<url>.sha256`, default false. File output only. */
   noSha?: boolean
-  /** Fetch one byte range: START-END or START- (inclusive). Conflicts with `cont`. */
+  /** Fetch one byte range: START-END, START- (inclusive) or -N for the last N bytes. File output streams into `<out>.part`; `cont` resumes it. */
   range?: string
 }
 

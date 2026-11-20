@@ -106,6 +106,9 @@ pub(crate) struct Cli {
     /// Emit one NDJSON event per line on stdout.
     #[arg(long, global = true, help_heading = "Global options")]
     pub(crate) json: bool,
+    /// Emit the NDJSON events on stderr instead of stdout (implies --json).
+    #[arg(long, global = true, help_heading = "Global options")]
+    pub(crate) json_stderr: bool,
     /// Print the summary line, plus any failures.
     #[arg(short = 'q', long, global = true, help_heading = "Global options")]
     pub(crate) quiet: bool,
@@ -136,20 +139,36 @@ pub(crate) enum Cmd {
         #[arg(long, conflicts_with_all = ["out", "remote_name"])]
         stdout: bool,
         /// Resume from an existing `<out>`.part through a Range request.
+        /// A part parked by `--range` resumes that span, so `--range` may be omitted.
         #[arg(long = "continue")]
         cont: bool,
+        /// Resume like curl's `-C`: `-` continues the part, `N` starts at byte N.
+        #[arg(
+            short = 'C',
+            long = "continue-at",
+            value_name = "OFFSET",
+            allow_hyphen_values = true,
+            conflicts_with_all = ["cont", "range"]
+        )]
+        continue_at: Option<String>,
         /// Fetch through N concurrent byte-range requests (2 to 64).
         /// File output only: `--segments` with a stdout target is a misuse.
         #[arg(long, value_name = "N")]
         segments: Option<usize>,
-        /// Fetch one byte range: START-END or START- (inclusive), through a Range request.
-        /// Conflicts with --continue and --segments.
-        #[arg(long, value_name = "START-END", conflicts_with_all = ["cont", "segments"])]
+        /// Fetch one byte range: START-END, START- (inclusive), or the curl-style suffix -N.
+        /// A file target streams into `<out>.part`, `--continue` resumes it, and `--segments N` splits the span into N concurrent requests.
+        #[arg(long, value_name = "START-END", allow_hyphen_values = true)]
         range: Option<String>,
         /// Read the bytes without verifying `<url>.sha256`.
         /// File output only: a stdout stream is never verified, and a range has no object digest.
         #[arg(long = "no-sha")]
         no_sha: bool,
+    },
+    /// List parked ranged downloads in a directory.
+    Resume {
+        /// Directory to scan.
+        #[arg(value_name = "DIR", default_value = ".")]
+        dir: PathBuf,
     },
     /// PUT a file, optionally with its sha-sibling marker.
     Put {
@@ -542,11 +561,23 @@ fn main() -> std::process::ExitCode {
         .expect("the work thread carries the exit code")
 }
 
+/// Write one NDJSON line to stdout or stderr.
+fn json_line(value: &serde_json::Value, stderr: bool) {
+    let text = value.to_string();
+    if stderr {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{text}");
+    } else {
+        outln!("{text}");
+    }
+}
+
 fn run_main() -> std::process::ExitCode {
     // The NDJSON channel must carry a parse failure too: clap would otherwise
     // print its own text and exit before the renderer exists, breaking the
     // `--json` contract the docs promise.
-    let json = std::env::args_os().any(|arg| arg == "--json");
+    let json_stderr = std::env::args_os().any(|arg| arg == "--json-stderr");
+    let json = json_stderr || std::env::args_os().any(|arg| arg == "--json");
     let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
@@ -564,14 +595,14 @@ fn run_main() -> std::process::ExitCode {
                 .to_owned();
             let hint = "check the command shape: nxr --help, or nxr <command> --help";
             if json {
-                outln!(
-                    "{}",
-                    serde_json::json!({
+                json_line(
+                    &serde_json::json!({
                         "event": "error",
                         "code": 2,
                         "error": detail,
                         "hint": hint,
-                    })
+                    }),
+                    json_stderr,
                 );
             } else {
                 let _ = e.print();
@@ -580,18 +611,19 @@ fn run_main() -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
+    cli.json |= cli.json_stderr;
     if let Err(e) = alias::apply_remote(&mut cli) {
         if cli.json {
             // The NDJSON channel carries the failure alone: scripts parse this
             // line, and a plaintext echo on stderr would leak into their logs.
-            outln!(
-                "{}",
-                serde_json::json!({
+            json_line(
+                &serde_json::json!({
                     "event": "error",
                     "code": e.exit_code(),
                     "error": e.to_string(),
                     "hint": e.hint(),
-                })
+                }),
+                cli.json_stderr,
             );
         } else {
             eprintln!("error: {e}");
@@ -618,14 +650,14 @@ fn run_main() -> std::process::ExitCode {
             if cli.json {
                 // The NDJSON channel carries the failure alone: scripts parse
                 // this line, they do not scrape stderr.
-                outln!(
-                    "{}",
-                    serde_json::json!({
+                json_line(
+                    &serde_json::json!({
                         "event": "error",
                         "code": e.exit_code(),
                         "error": e.to_string(),
                         "hint": e.hint(),
-                    })
+                    }),
+                    cli.json_stderr,
                 );
             } else {
                 eprintln!("error: {e}");

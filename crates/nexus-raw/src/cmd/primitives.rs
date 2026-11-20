@@ -8,6 +8,7 @@ use nexus_raw_core::model::name::ArtifactName;
 use nexus_raw_core::{Error, ShaSource};
 
 use crate::cmd::{finish, make_ctx, print_line, Ctx};
+use crate::render::human_bytes;
 use crate::Cli;
 
 /// The `get` invocation: the CLI spelling, resolved into what the transfer needs.
@@ -46,9 +47,9 @@ pub(crate) async fn get(cli: &Cli, args: GetArgs<'_>) -> Result<(), Error> {
                 .to_owned(),
         ));
     }
-    if out.is_none() && cli.json {
+    if out.is_none() && cli.json && !cli.json_stderr {
         return Err(Error::Misuse(
-            "--json with stdout body would corrupt the artifact: pass -o FILE, or drop --json"
+            "--json with a stdout body would interleave events and bytes: pass -o FILE, use --json-stderr, or drop --json"
                 .to_owned(),
         ));
     }
@@ -73,10 +74,14 @@ pub(crate) async fn get(cli: &Cli, args: GetArgs<'_>) -> Result<(), Error> {
             "the stdout stream is never verified: --no-sha changes nothing there".to_owned(),
         ));
     }
-    if range.is_some() && (cont || segments.is_some()) {
-        return Err(Error::Misuse(
-            "--range reads one span: pass --range without --continue or --segments".to_owned(),
-        ));
+    if range.is_some() && segments.is_some() {
+        // The ranged segment path owns the combination: the guard stays for
+        // `--continue`, which cannot resume a segmented span.
+        if cont {
+            return Err(Error::Misuse(
+                "--continue resumes one part file: pass --range with --segments without --continue, or drop --segments".to_owned(),
+            ));
+        }
     }
     // The flag combinations are judged first, because their refusals name the precise
     // fix. Only a plain fetch reaches the terminal rule, which owns the three ways out.
@@ -103,7 +108,45 @@ async fn run_get(
     no_sha: bool,
 ) -> Result<(), Error> {
     if let Some(spec) = range {
-        return run_get_range(ctx, url, out, spec).await;
+        if let Some(n) = segments {
+            let outcome = ctx
+                .nxr
+                .get_segmented_span(
+                    url,
+                    spec,
+                    out.expect("segments require a file target").to_owned(),
+                    n,
+                )
+                .await?;
+            report_span(ctx, url, out, &outcome);
+            return Ok(());
+        }
+        let outcome = ctx
+            .nxr
+            .get_span(url, spec, out.map(Path::to_owned), cont)
+            .await?;
+        report_span(ctx, url, out, &outcome);
+        return Ok(());
+    }
+    // A parked part may belong to a span: `--continue` resumes that span
+    // instead of reading its bytes as a whole-object prefix.
+    if let Some(path) = out {
+        if cont {
+            if let Some((start, end)) = nexus_raw_core::primitive::recorded_span(path)? {
+                let spec = span_spec(start, end);
+                let outcome = ctx
+                    .nxr
+                    .get_span(url, &spec, Some(path.to_owned()), true)
+                    .await?;
+                report_span(ctx, url, Some(path), &outcome);
+                return Ok(());
+            }
+            // No parked span: the whole-object resume starts clean, and the
+            // core clears a stale record that has no part.
+        } else if segments.is_some() {
+            // A fresh segmented run owns the part, so a parked span goes with it.
+            nexus_raw_core::primitive::clear_parked_span(path)?;
+        }
     }
     let outcome = match segments {
         Some(n) => {
@@ -147,6 +190,76 @@ fn remote_name_of(url: &str) -> Result<String, Error> {
                 "get -O takes the URL's last segment as the name, and the name {leaf:?} is not writable here ({e}): pass -o FILE"
             ))
         })
+}
+
+/// Quote one argument for the copy-paste shell line.
+/// A bare word stays bare; anything else is single-quoted, with an embedded
+/// quote written as `'\''`.
+fn shell_quote(value: &str) -> String {
+    let bare = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:@%+=".contains(c));
+    if bare {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// List the parked ranged downloads in `dir`: no network, no credentials.
+pub(crate) async fn resume(cli: &Cli, dir: &Path) -> Result<(), Error> {
+    let parked = nexus_raw_core::primitive::list_parked_spans(dir)?;
+    if parked.is_empty() {
+        if !cli.json {
+            print_line(
+                false,
+                &format!("no parked spans in {}", dir.display()),
+                &serde_json::Value::Null,
+            );
+        }
+        return Ok(());
+    }
+    for span in parked {
+        let label = span_spec(span.start, span.end);
+        let total = span.total.map_or_else(|| "?".to_owned(), human_bytes);
+        let out_label = span.out.as_ref().map_or_else(
+            || "<unknown part>".to_owned(),
+            |out| out.display().to_string(),
+        );
+        let human = format!(
+            "{out_label}: {} parked of span {label} (object {total})",
+            human_bytes(span.part_size),
+        );
+        print_line(
+            cli.json,
+            &human,
+            &serde_json::json!({
+                "event": "resume",
+                "out": span.out.as_ref().map(|out| out.display().to_string()),
+                "part": span.part.as_ref().map(|p| p.display().to_string()),
+                "url": span.url.as_deref(),
+                "start": span.start,
+                "end": span.end,
+                "total": span.total,
+                "bytes": span.part_size,
+            }),
+        );
+        if !cli.json {
+            if let (Some(url), Some(out)) = (&span.url, &span.out) {
+                print_line(
+                    false,
+                    &format!(
+                        "  resume: nxr get {} -o {} --continue",
+                        shell_quote(url),
+                        shell_quote(&out.display().to_string())
+                    ),
+                    &serde_json::Value::Null,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn put(
@@ -299,45 +412,40 @@ async fn run_sha(ctx: &Ctx, target: &str) -> Result<(), Error> {
     Ok(())
 }
 
-async fn run_get_range(ctx: &Ctx, url: &str, out: Option<&Path>, spec: &str) -> Result<(), Error> {
-    let range = ctx.nxr.get_range(url, spec).await?;
-    let label = match range.end {
-        Some(end) => format!("{}-{end}", range.start),
-        None => format!("{}-", range.start),
-    };
-    match out {
-        Some(path) => {
-            nexus_raw_core::primitive::write_bytes_atomically(path, &range.bytes)?;
-            print_line(
-                ctx.json,
-                &format!(
-                    "range {label}: {} bytes → {}",
-                    range.bytes.len(),
-                    path.display()
-                ),
-                &serde_json::json!({
-                    "ok": true,
-                    "url": url,
-                    "out": path.display().to_string(),
-                    "range": label,
-                    "bytes": range.bytes.len(),
-                }),
-            );
-        }
-        None => {
-            use std::io::Write;
-            let mut stdout = std::io::stdout().lock();
-            stdout.write_all(&range.bytes).map_err(|e| Error::Io {
-                path: "-".to_owned(),
-                detail: e.to_string(),
-            })?;
-            stdout.flush().map_err(|e| Error::Io {
-                path: "-".to_owned(),
-                detail: e.to_string(),
-            })?;
-        }
+fn span_spec(start: u64, end: Option<u64>) -> String {
+    match end {
+        Some(end) => format!("{start}-{end}"),
+        None => format!("{start}-"),
     }
-    Ok(())
+}
+
+fn report_span(ctx: &Ctx, url: &str, out: Option<&Path>, outcome: &nexus_raw_core::SpanOutcome) {
+    // A stdout span is already the output: a line would corrupt it.
+    let Some(path) = out else {
+        return;
+    };
+    let label = span_spec(outcome.start, outcome.end);
+    let resumed = if outcome.resumed_from > 0 {
+        format!(" (resumed from {})", outcome.resumed_from)
+    } else {
+        String::new()
+    };
+    print_line(
+        ctx.json,
+        &format!(
+            "range {label}: {} bytes → {}{resumed}",
+            outcome.size,
+            path.display()
+        ),
+        &serde_json::json!({
+            "ok": true,
+            "url": url,
+            "out": path.display().to_string(),
+            "range": label,
+            "bytes": outcome.size,
+            "resumed_from": outcome.resumed_from,
+        }),
+    );
 }
 
 fn report_get(ctx: &Ctx, url: &str, out: Option<&Path>, outcome: &nexus_raw_core::GetOutcome) {
@@ -372,8 +480,20 @@ fn report_get(ctx: &Ctx, url: &str, out: Option<&Path>, outcome: &nexus_raw_core
 
 #[cfg(test)]
 mod tests {
-    use super::refuses_a_terminal;
+    use super::{refuses_a_terminal, shell_quote};
     use std::path::Path;
+
+    #[test]
+    fn shell_quote_keeps_the_hint_copy_pasteable() {
+        assert_eq!(shell_quote("app.zip"), "app.zip");
+        assert_eq!(shell_quote("dir/app.zip"), "dir/app.zip");
+        assert_eq!(
+            shell_quote("dir with space/app.zip"),
+            "'dir with space/app.zip'"
+        );
+        assert_eq!(shell_quote("it's.bin"), "'it'\\''s.bin'");
+        assert_eq!(shell_quote(""), "''");
+    }
 
     #[test]
     fn a_terminal_refuses_a_body_unless_asked() {
